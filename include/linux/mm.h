@@ -18,10 +18,6 @@
 #include <linux/bit_spinlock.h>
 #include <linux/shrinker.h>
 
-#ifdef CONFIG_STRICT_MEMORY_RWX
-extern char __init_data_begin[];
-#endif
-
 struct mempolicy;
 struct anon_vma;
 struct anon_vma_chain;
@@ -35,9 +31,6 @@ extern unsigned long max_mapnr;
 
 extern unsigned long num_physpages;
 extern unsigned long totalram_pages;
-#ifdef CONFIG_FIX_MOVABLE_ZONE
-extern unsigned long total_unmovable_pages;
-#endif
 extern void * high_memory;
 extern int page_cluster;
 
@@ -69,6 +62,9 @@ extern unsigned long sysctl_admin_reserve_kbytes;
 
 /* to align the pointer to the (next) page boundary */
 #define PAGE_ALIGN(addr) ALIGN(addr, PAGE_SIZE)
+
+/* test whether an address (unsigned long or pointer) is aligned to PAGE_SIZE */
+#define PAGE_ALIGNED(addr)	IS_ALIGNED((unsigned long)addr, PAGE_SIZE)
 
 /*
  * Linux kernel virtual memory manager primitives.
@@ -117,6 +113,7 @@ extern unsigned int kobjsize(const void *objp);
 
 #define VM_DONTCOPY	0x00020000      /* Do not copy this vma on fork */
 #define VM_DONTEXPAND	0x00040000	/* Cannot expand with mremap() */
+#define VM_LOCKONFAULT	0x00080000	/* Lock the pages covered when they are faulted in */
 #define VM_ACCOUNT	0x00100000	/* Is a VM accounted object */
 #define VM_NORESERVE	0x00200000	/* should the VM suppress accounting */
 #define VM_HUGETLB	0x00400000	/* Huge TLB Page VM */
@@ -172,6 +169,9 @@ extern unsigned int kobjsize(const void *objp);
  */
 #define VM_SPECIAL (VM_IO | VM_DONTEXPAND | VM_PFNMAP)
 
+/* This mask is used to clear all the VMA flags used by mlock */
+#define VM_LOCKED_CLEAR_MASK	(~(VM_LOCKED | VM_LOCKONFAULT))
+
 /*
  * mapping from the currently active vm_flags protection bits (the
  * low four bits) to a page protection mask..
@@ -186,6 +186,7 @@ extern pgprot_t protection_map[16];
 #define FAULT_FLAG_KILLABLE	0x20	/* The fault task is in SIGKILL killable region */
 #define FAULT_FLAG_TRIED	0x40	/* second try */
 #define FAULT_FLAG_USER		0x80	/* The fault originated in userspace */
+#define FAULT_FLAG_NO_CMA      0x100    /* don't use CMA pages */
 
 /*
  * vm_fault is filled by the the pagefault handler and passed to the vma's
@@ -248,12 +249,13 @@ struct vm_operations_struct {
 	 */
 	struct mempolicy *(*get_policy)(struct vm_area_struct *vma,
 					unsigned long addr);
-	int (*migrate)(struct vm_area_struct *vma, const nodemask_t *from,
-		const nodemask_t *to, unsigned long flags);
 #endif
 	/* called by sys_remap_file_pages() to populate non-linear mapping */
 	int (*remap_pages)(struct vm_area_struct *vma, unsigned long addr,
 			   unsigned long size, pgoff_t pgoff);
+	/* called when driver allows fixing ptes with none protections */
+	bool (*fixup_prot)(struct vm_area_struct *vma, unsigned long addr,
+			  pgoff_t pgoff);
 };
 
 struct mmu_gather;
@@ -324,16 +326,16 @@ unsigned long vmalloc_to_pfn(const void *addr);
  * On nommu, vmalloc/vfree wrap through kmalloc/kfree directly, so there
  * is no special casing required.
  */
-
-#ifdef CONFIG_MMU
-extern int is_vmalloc_addr(const void *x);
-#else
 static inline int is_vmalloc_addr(const void *x)
 {
-	return 0;
-}
-#endif
+#ifdef CONFIG_MMU
+	unsigned long addr = (unsigned long)x;
 
+	return addr >= VMALLOC_START && addr < VMALLOC_END;
+#else
+	return 0;
+#endif
+}
 #ifdef CONFIG_MMU
 extern int is_vmalloc_or_module_addr(const void *x);
 #else
@@ -342,6 +344,20 @@ static inline int is_vmalloc_or_module_addr(const void *x)
 	return 0;
 }
 #endif
+
+extern void *kvmalloc_node(size_t size, gfp_t flags, int node);
+static inline void *kvmalloc(size_t size, gfp_t flags)
+{
+	return kvmalloc_node(size, flags, NUMA_NO_NODE);
+}
+static inline void *kvzalloc_node(size_t size, gfp_t flags, int node)
+{
+	return kvmalloc_node(size, flags | __GFP_ZERO, node);
+}
+static inline void *kvzalloc(size_t size, gfp_t flags)
+{
+	return kvmalloc(size, flags | __GFP_ZERO);
+}
 
 extern void kvfree(const void *addr);
 
@@ -549,6 +565,10 @@ static inline pte_t maybe_mkwrite(pte_t pte, struct vm_area_struct *vma)
 		pte = pte_mkwrite(pte);
 	return pte;
 }
+#endif
+
+#ifdef CONFIG_CMA
+unsigned int cma_threshold_get(void);
 #endif
 
 /*
@@ -945,6 +965,14 @@ extern bool skip_free_areas_node(unsigned int flags, int nid);
 
 void shmem_set_file(struct vm_area_struct *vma, struct file *file);
 int shmem_zero_setup(struct vm_area_struct *);
+#ifdef CONFIG_SHMEM
+bool shmem_mapping(struct address_space *mapping);
+#else
+static inline bool shmem_mapping(struct address_space *mapping)
+{
+	return false;
+}
+#endif
 
 extern int can_do_mlock(void);
 extern int user_shm_lock(size_t, struct user_struct *);
@@ -1025,7 +1053,7 @@ static inline void unmap_shared_mapping_range(struct address_space *mapping,
 	unmap_mapping_range(mapping, holebegin, holelen, 0);
 }
 
-extern void truncate_pagecache(struct inode *inode, loff_t old, loff_t new);
+extern void truncate_pagecache(struct inode *inode, loff_t new);
 extern void truncate_setsize(struct inode *inode, loff_t newsize);
 void pagecache_isize_extended(struct inode *inode, loff_t from, loff_t to);
 void truncate_pagecache_range(struct inode *inode, loff_t offset, loff_t end);
@@ -1065,10 +1093,7 @@ long __get_user_pages(struct task_struct *tsk, struct mm_struct *mm,
 		      unsigned long start, unsigned long nr_pages,
 		      unsigned int foll_flags, struct page **pages,
 		      struct vm_area_struct **vmas, int *nonblocking);
-long get_user_pages(struct task_struct *tsk, struct mm_struct *mm,
-		    unsigned long start, unsigned long nr_pages,
-		    int write, int force, struct page **pages,
-		    struct vm_area_struct **vmas);
+
 int get_user_pages_fast(unsigned long start, int nr_pages, int write,
 			struct page **pages);
 struct kvec;
@@ -1078,7 +1103,8 @@ int get_kernel_page(unsigned long start, int write, struct page **pages);
 struct page *get_dump_page(unsigned long addr);
 
 extern int try_to_release_page(struct page * page, gfp_t gfp_mask);
-extern void do_invalidatepage(struct page *page, unsigned long offset);
+extern void do_invalidatepage(struct page *page, unsigned int offset,
+			      unsigned int length);
 
 int __set_page_dirty_nobuffers(struct page *page);
 int __set_page_dirty_no_writeback(struct page *page);
@@ -1170,6 +1196,11 @@ static inline void update_hiwater_vm(struct mm_struct *mm)
 {
 	if (mm->hiwater_vm < mm->total_vm)
 		mm->hiwater_vm = mm->total_vm;
+}
+
+static inline void reset_mm_hiwater_rss(struct mm_struct *mm)
+{
+	mm->hiwater_rss = get_mm_rss(mm);
 }
 
 static inline void setmax_mm_hiwater_rss(unsigned long *maxrss,
@@ -1319,7 +1350,6 @@ extern void free_initmem(void);
  */
 extern unsigned long free_reserved_area(unsigned long start, unsigned long end,
 					int poison, char *s);
-
 #ifdef	CONFIG_HIGHMEM
 /*
  * Free a highmem page into the buddy system, adjusting totalhigh_pages
@@ -1328,8 +1358,10 @@ extern unsigned long free_reserved_area(unsigned long start, unsigned long end,
 extern void free_highmem_page(struct page *page);
 #endif
 
-extern void adjust_managed_page_count(struct page *page, long count);
-extern void mem_init_print_info(const char *str);
+static inline void adjust_managed_page_count(struct page *page, long count)
+{
+	totalram_pages += count;
+}
 
 /* Free the reserved page into the buddy system, so it gets managed. */
 static inline void __free_reserved_page(struct page *page)
@@ -1363,17 +1395,6 @@ static inline unsigned long free_initmem_default(int poison)
 	return free_reserved_area(PAGE_ALIGN((unsigned long)&__init_begin) ,
 				  ((unsigned long)&__init_end) & PAGE_MASK,
 				  poison, "unused kernel");
-}
-
-static inline unsigned long get_num_physpages(void)
-{
-	int nid;
-	unsigned long phys_pages = 0;
-
-	for_each_online_node(nid)
-		phys_pages += node_present_pages(nid);
-
-	return phys_pages;
 }
 
 #ifdef CONFIG_HAVE_MEMBLOCK_NODE_MAP
@@ -1592,6 +1613,7 @@ vm_unmapped_area(struct vm_unmapped_area_info *info)
 extern void truncate_inode_pages(struct address_space *, loff_t);
 extern void truncate_inode_pages_range(struct address_space *,
 				       loff_t lstart, loff_t lend);
+extern void truncate_inode_pages_final(struct address_space *);
 
 /* generic vm_area_ops exported for stackable file systems */
 extern int filemap_fault(struct vm_area_struct *, struct vm_fault *);
@@ -1602,7 +1624,7 @@ int write_one_page(struct page *page, int wait);
 void task_dirty_inc(struct task_struct *tsk);
 
 /* readahead.c */
-#define VM_MAX_READAHEAD	CONFIG_VM_MAX_READAHEAD	/* kbytes */
+#define VM_MAX_READAHEAD	128	/* kbytes */
 #define VM_MIN_READAHEAD	16	/* kbytes (includes current page) */
 
 int force_page_cache_readahead(struct address_space *mapping, struct file *filp,
@@ -1698,10 +1720,16 @@ static inline struct vm_area_struct *find_exact_vma(struct mm_struct *mm,
 
 #ifdef CONFIG_MMU
 pgprot_t vm_get_page_prot(unsigned long vm_flags);
+bool vm_set_page_prot(struct vm_area_struct *vma);
 #else
 static inline pgprot_t vm_get_page_prot(unsigned long vm_flags)
 {
 	return __pgprot(0);
+}
+static inline bool vm_set_page_prot(struct vm_area_struct *vma)
+{
+	vma->vm_page_prot = vm_get_page_prot(vma->vm_flags);
+	return 0;
 }
 #endif
 
@@ -1739,17 +1767,88 @@ static inline struct page *follow_page(struct vm_area_struct *vma,
 #define FOLL_FORCE	0x10	/* get_user_pages read/write w/o permission */
 #define FOLL_NOWAIT	0x20	/* if a disk transfer is needed, start the IO
 				 * and return without waiting upon it */
-#define FOLL_MLOCK	0x40	/* mark page as mlocked */
+#define FOLL_POPULATE	0x40	/* fault in page */
 #define FOLL_SPLIT	0x80	/* don't return transhuge pages, split them */
 #define FOLL_HWPOISON	0x100	/* check page is hwpoisoned */
 #define FOLL_NUMA	0x200	/* force NUMA hinting page fault */
 #define FOLL_MIGRATION	0x400	/* wait for page to replace migration entry */
+#define FOLL_DURABLE	0x800	/* get the page reference for a long time */
+#define FOLL_MLOCK	0x1000	/* lock present pages */
 #define FOLL_COW	0x4000	/* internal GUP flag */
 
 typedef int (*pte_fn_t)(pte_t *pte, pgtable_t token, unsigned long addr,
 			void *data);
 extern int apply_to_page_range(struct mm_struct *mm, unsigned long address,
 			       unsigned long size, pte_fn_t fn, void *data);
+
+/*
+ * get_user_pages() - pin user pages in memory
+ * @tsk:	the task_struct to use for page fault accounting, or
+ *		NULL if faults are not to be recorded.
+ * @mm:		mm_struct of target mm
+ * @start:	starting user address
+ * @nr_pages:	number of pages from start to pin
+ * @write:	whether pages will be written to by the caller
+ * @force:	whether to force write access even if user mapping is
+ *		readonly. This will result in the page being COWed even
+ *		in MAP_SHARED mappings. You do not want this.
+ * @pages:	array that receives pointers to the pages pinned.
+ *		Should be at least nr_pages long. Or NULL, if caller
+ *		only intends to ensure the pages are faulted in.
+ * @vmas:	array of pointers to vmas corresponding to each page.
+ *		Or NULL if the caller does not require them.
+ *
+ * Returns number of pages pinned. This may be fewer than the number
+ * requested. If nr_pages is 0 or negative, returns 0. If no pages
+ * were pinned, returns -errno. Each page returned must be released
+ * with a put_page() call when it is finished with. vmas will only
+ * remain valid while mmap_sem is held.
+ *
+ * Must be called with mmap_sem held for read or write.
+ *
+ * get_user_pages walks a process's page tables and takes a reference to
+ * each struct page that each user address corresponds to at a given
+ * instant. That is, it takes the page that would be accessed if a user
+ * thread accesses the given user virtual address at that instant.
+ *
+ * This does not guarantee that the page exists in the user mappings when
+ * get_user_pages returns, and there may even be a completely different
+ * page there in some cases (eg. if mmapped pagecache has been invalidated
+ * and subsequently re faulted). However it does guarantee that the page
+ * won't be freed completely. And mostly callers simply care that the page
+ * contains data that was valid *at some point in time*. Typically, an IO
+ * or similar operation cannot guarantee anything stronger anyway because
+ * locks can't be held over the syscall boundary.
+ *
+ * If write=0, the page must not be written to. If the page is written to,
+ * set_page_dirty (or set_page_dirty_lock, as appropriate) must be called
+ * after the page is finished with, and before put_page is called.
+ *
+ * get_user_pages is typically used for fewer-copy IO operations, to get a
+ * handle on the memory by some means other than accesses via the user virtual
+ * addresses. The pages may be submitted for DMA to devices or accessed via
+ * their kernel linear mapping (via the kmap APIs). Care should be taken to
+ * use the correct cache flushing APIs.
+ *
+ * See also get_user_pages_fast, for performance critical applications.
+ */
+static inline long get_user_pages(struct task_struct *tsk, struct mm_struct *mm,
+			unsigned long start, unsigned long nr_pages, int write,
+			int force, struct page **pages,
+			struct vm_area_struct **vmas)
+{
+	int flags = FOLL_TOUCH;
+
+	if (pages)
+		flags |= FOLL_GET;
+	if (write)
+		flags |= FOLL_WRITE;
+	if (force)
+		flags |= FOLL_FORCE;
+
+	return __get_user_pages(tsk, mm, start, nr_pages, flags, pages, vmas,
+				NULL);
+}
 
 #ifdef CONFIG_PROC_FS
 void vm_stat_account(struct mm_struct *, unsigned long, struct file *, long);
@@ -1782,32 +1881,6 @@ int in_gate_area(struct mm_struct *mm, unsigned long addr);
 int in_gate_area_no_mm(unsigned long addr);
 #define in_gate_area(mm, addr) ({(void)mm; in_gate_area_no_mm(addr);})
 #endif	/* __HAVE_ARCH_GATE_AREA */
-
-#ifdef CONFIG_USE_USER_ACCESSIBLE_TIMERS
-static inline int use_user_accessible_timers(void) { return 1; }
-extern int in_user_timers_area(struct mm_struct *mm, unsigned long addr);
-extern struct vm_area_struct *get_user_timers_vma(struct mm_struct *mm);
-extern int get_user_timer_page(struct vm_area_struct *vma,
-	struct mm_struct *mm, unsigned long start, unsigned int gup_flags,
-	struct page **pages, int idx, int *goto_next_page);
-#else
-static inline int use_user_accessible_timers(void) { return 0; }
-static inline int in_user_timers_area(struct mm_struct *mm, unsigned long addr)
-{
-	return 0;
-}
-static inline struct vm_area_struct *get_user_timers_vma(struct mm_struct *mm)
-{
-	return NULL;
-}
-static inline int get_user_timer_page(struct vm_area_struct *vma,
-	struct mm_struct *mm, unsigned long start, unsigned int gup_flags,
-	struct page **pages, int idx, int *goto_next_page)
-{
-	*goto_next_page = 0;
-	return 0;
-}
-#endif
 
 #ifdef CONFIG_SYSCTL
 extern int sysctl_drop_caches;
@@ -1894,25 +1967,23 @@ static inline unsigned int debug_guardpage_minorder(void) { return 0; }
 static inline bool page_is_guard(struct page *page) { return false; }
 #endif /* CONFIG_DEBUG_PAGEALLOC */
 
+
 #if MAX_NUMNODES > 1
 void __init setup_nr_node_ids(void);
 #else
 static inline void setup_nr_node_ids(void) {}
 #endif
 
-#ifdef CONFIG_PROCESS_RECLAIM
-struct reclaim_param {
-	struct vm_area_struct *vma;
-	/* Number of pages scanned */
-	int nr_scanned;
-	/* max pages to reclaim */
-	int nr_to_reclaim;
-	/* pages reclaimed */
-	int nr_reclaimed;
-};
-extern struct reclaim_param reclaim_task_anon(struct task_struct *task,
-		int nr_to_reclaim);
-#endif
+#ifdef CONFIG_HMM
+static inline void hmm_mm_init(struct mm_struct *mm)
+{
+	mm->hmm = NULL;
+}
+#else /* !CONFIG_HMM */
+static inline void hmm_mm_init(struct mm_struct *mm)
+{
+}
+#endif /* !CONFIG_HMM */
 
 #endif /* __KERNEL__ */
 #endif /* _LINUX_MM_H */

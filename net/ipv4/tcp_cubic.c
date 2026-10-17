@@ -335,7 +335,8 @@ tcp_friendliness:
 		ca->cnt = 1;
 }
 
-static void bictcp_cong_avoid(struct sock *sk, u32 ack, u32 in_flight)
+static void bictcp_cong_avoid(struct sock *sk, u32 ack, u32 acked,
+			      u32 in_flight)
 {
 	struct tcp_sock *tp = tcp_sk(sk);
 	struct bictcp *ca = inet_csk_ca(sk);
@@ -346,7 +347,7 @@ static void bictcp_cong_avoid(struct sock *sk, u32 ack, u32 in_flight)
 	if (tp->snd_cwnd <= tp->snd_ssthresh) {
 		if (hystart && after(ack, ca->end_seq))
 			bictcp_hystart_reset(sk);
-		tcp_slow_start(tp);
+		tcp_slow_start(tp, acked);
 	} else {
 		bictcp_update(ca, tp->snd_cwnd);
 		tcp_cong_avoid_ai(tp, ca->cnt);
@@ -425,7 +426,7 @@ static void hystart_update(struct sock *sk, u32 delay)
 /* Track delayed acknowledgment ratio using sliding window
  * ratio = (15*ratio + sample) / 16
  */
-static void bictcp_acked(struct sock *sk, u32 cnt, s32 rtt_us)
+static void bictcp_acked(struct sock *sk, const struct ack_sample *sample)
 {
 	const struct inet_connection_sock *icsk = inet_csk(sk);
 	const struct tcp_sock *tp = tcp_sk(sk);
@@ -436,20 +437,20 @@ static void bictcp_acked(struct sock *sk, u32 cnt, s32 rtt_us)
 		u32 ratio = ca->delayed_ack;
 
 		ratio -= ca->delayed_ack >> ACK_RATIO_SHIFT;
-		ratio += cnt;
+		ratio += sample->pkts_acked;
 
 		ca->delayed_ack = clamp(ratio, 1U, ACK_RATIO_LIMIT);
 	}
 
 	/* Some calls are for duplicates without timetamps */
-	if (rtt_us < 0)
+	if (sample->rtt_us < 0)
 		return;
 
 	/* Discard delay samples right after fast recovery */
 	if (ca->epoch_start && (s32)(tcp_time_stamp - ca->epoch_start) < HZ)
 		return;
 
-	delay = (rtt_us << 3) / USEC_PER_MSEC;
+	delay = (sample->rtt_us << 3) / USEC_PER_MSEC;
 	if (delay == 0)
 		delay = 1;
 
@@ -506,10 +507,6 @@ static int __init cubictcp_register(void)
 
 	/* divide by bic_scale and by constant Srtt (100ms) */
 	do_div(cube_factor, bic_scale * 10);
-
-	/* hystart needs ms clock resolution */
-	if (hystart && HZ < 1000)
-		cubictcp.flags |= TCP_CONG_RTT_STAMP;
 
 	return tcp_register_congestion_control(&cubictcp);
 }

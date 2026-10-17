@@ -921,7 +921,7 @@ bool dev_valid_name(const char *name)
 {
 	if (*name == '\0')
 		return false;
-	if (strnlen(name, IFNAMSIZ) == IFNAMSIZ)
+	if (strlen(name) >= IFNAMSIZ)
 		return false;
 	if (!strcmp(name, ".") || !strcmp(name, ".."))
 		return false;
@@ -2043,10 +2043,7 @@ EXPORT_SYMBOL(netif_set_xps_queue);
  */
 int netif_set_real_num_tx_queues(struct net_device *dev, unsigned int txq)
 {
-	bool disabling;
 	int rc;
-
-	disabling = txq < dev->real_num_tx_queues;
 
 	if (txq < 1 || txq > dev->num_tx_queues)
 		return -EINVAL;
@@ -2063,19 +2060,15 @@ int netif_set_real_num_tx_queues(struct net_device *dev, unsigned int txq)
 		if (dev->num_tc)
 			netif_setup_tc(dev, txq);
 
-		dev->real_num_tx_queues = txq;
-
-		if (disabling) {
-			synchronize_net();
+		if (txq < dev->real_num_tx_queues) {
 			qdisc_reset_all_tx_gt(dev, txq);
 #ifdef CONFIG_XPS
 			netif_reset_xps_queues_gt(dev, txq);
 #endif
 		}
-	} else {
-		dev->real_num_tx_queues = txq;
 	}
 
+	dev->real_num_tx_queues = txq;
 	return 0;
 }
 EXPORT_SYMBOL(netif_set_real_num_tx_queues);
@@ -2283,7 +2276,7 @@ __be16 skb_network_protocol(struct sk_buff *skb)
 		if (unlikely(!pskb_may_pull(skb, sizeof(struct ethhdr))))
 			return 0;
 
-		eth = (struct ethhdr *)skb->data;
+		eth = (struct ethhdr *)skb_mac_header(skb);
 		type = eth->h_proto;
 	}
 
@@ -2350,7 +2343,7 @@ static inline bool skb_needs_check(struct sk_buff *skb, bool tx_path)
 {
 	if (tx_path)
 		return skb->ip_summed != CHECKSUM_PARTIAL &&
-		       skb->ip_summed != CHECKSUM_UNNECESSARY;
+		       skb->ip_summed != CHECKSUM_NONE;
 
 	return skb->ip_summed == CHECKSUM_NONE;
 }
@@ -2535,21 +2528,6 @@ netdev_features_t netif_skb_dev_features(struct sk_buff *skb,
 	return harmonize_features(skb, protocol, dev, features);
 }
 EXPORT_SYMBOL(netif_skb_dev_features);
-
-/*
- * Returns true if either:
- *	1. skb has frag_list and the device doesn't support FRAGLIST, or
- *	2. skb is fragmented and the device does not support SG.
- */
-static inline int skb_needs_linearize(struct sk_buff *skb,
-				      netdev_features_t features)
-{
-	return skb_is_nonlinear(skb) &&
-			((skb_has_frag_list(skb) &&
-				!(features & NETIF_F_FRAGLIST)) ||
-			(skb_shinfo(skb)->nr_frags &&
-				!(features & NETIF_F_SG)));
-}
 
 int dev_hard_start_xmit(struct sk_buff *skb, struct net_device *dev,
 			struct netdev_queue *txq)
@@ -2761,7 +2739,8 @@ static void skb_update_prio(struct sk_buff *skb)
 	struct netprio_map *map = rcu_dereference_bh(skb->dev->priomap);
 
 	if (!skb->priority && skb->sk && map) {
-		unsigned int prioidx = skb->sk->sk_cgrp_prioidx;
+		unsigned int prioidx =
+			sock_cgroup_prioidx(&skb->sk->sk_cgrp_data);
 
 		if (prioidx < map->priomap_len)
 			skb->priority = map->priomap[prioidx];
@@ -2771,8 +2750,7 @@ static void skb_update_prio(struct sk_buff *skb)
 #define skb_update_prio(skb)
 #endif
 
-static DEFINE_PER_CPU(int, xmit_recursion);
-#define RECURSION_LIMIT 10
+DEFINE_PER_CPU(int, xmit_recursion);
 
 /**
  *	dev_loopback_xmit - loop back @skb
@@ -2861,7 +2839,8 @@ int dev_queue_xmit(struct sk_buff *skb)
 
 		if (txq->xmit_lock_owner != cpu) {
 
-			if (__this_cpu_read(xmit_recursion) > RECURSION_LIMIT)
+                       if (unlikely(__this_cpu_read(xmit_recursion) >
+                                    XMIT_RECURSION_LIMIT))
 				goto recursion_alert;
 
 			HARD_TX_LOCK(dev, txq, cpu);
@@ -3014,7 +2993,7 @@ static int get_rps_cpu(struct net_device *dev, struct sk_buff *skb,
 	}
 
 	skb_reset_network_header(skb);
-	if (!skb_get_rxhash(skb))
+	if (!skb_get_hash(skb))
 		goto done;
 
 	flow_table = rcu_dereference(rxqueue->rps_flow_table);
@@ -3373,6 +3352,16 @@ static inline struct sk_buff *handle_ing(struct sk_buff *skb,
 	case TC_ACT_STOLEN:
 		kfree_skb(skb);
 		return NULL;
+	case TC_ACT_REDIRECT:
+		/* skb_mac_header check was done by cls/act_bpf, so
+		 * we can safely push the L2 header back before
+		 * redirecting to another netdev
+		 */
+		__skb_push(skb, skb->mac_len);
+		skb_do_redirect(skb);
+		return NULL;
+	default:
+		break;
 	}
 
 out:
@@ -4068,28 +4057,20 @@ static void net_rps_action_and_irq_enable(struct softnet_data *sd)
 		local_irq_enable();
 }
 
-static bool sd_has_rps_ipi_waiting(struct softnet_data *sd)
-{
-#ifdef CONFIG_RPS
-	return sd->rps_ipi_list != NULL;
-#else
-	return false;
-#endif
-}
-
 static int process_backlog(struct napi_struct *napi, int quota)
 {
 	int work = 0;
 	struct softnet_data *sd = container_of(napi, struct softnet_data, backlog);
 
+#ifdef CONFIG_RPS
 	/* Check if we have pending ipi, its better to send them now,
 	 * not waiting net_rx_action() end.
 	 */
-	if (sd_has_rps_ipi_waiting(sd)) {
+	if (sd->rps_ipi_list) {
 		local_irq_disable();
 		net_rps_action_and_irq_enable(sd);
 	}
-
+#endif
 	napi->weight = weight_p;
 	local_irq_disable();
 	while (work < quota) {
@@ -4123,6 +4104,7 @@ static int process_backlog(struct napi_struct *napi, int quota)
 			 * we can use a plain write instead of clear_bit(),
 			 * and we dont need an smp_mb() memory barrier.
 			 */
+			list_del(&napi->poll_list);
 			napi->state = 0;
 
 			quota = work + qlen;
@@ -4155,7 +4137,7 @@ void __napi_complete(struct napi_struct *n)
 	BUG_ON(!test_bit(NAPI_STATE_SCHED, &n->state));
 	BUG_ON(n->gro_list);
 
-	list_del_init(&n->poll_list);
+	list_del(&n->poll_list);
 	smp_mb__before_atomic();
 	clear_bit(NAPI_STATE_SCHED, &n->state);
 }
@@ -4173,15 +4155,9 @@ void napi_complete(struct napi_struct *n)
 		return;
 
 	napi_gro_flush(n, false);
-
-	if (likely(list_empty(&n->poll_list))) {
-		WARN_ON_ONCE(!test_and_clear_bit(NAPI_STATE_SCHED, &n->state));
-	} else {
-		/* If n->poll_list is not empty, we need to mask irqs */
-		local_irq_save(flags);
-		__napi_complete(n);
-		local_irq_restore(flags);
-	}
+	local_irq_save(flags);
+	__napi_complete(n);
+	local_irq_restore(flags);
 }
 EXPORT_SYMBOL(napi_complete);
 
@@ -4230,28 +4206,29 @@ static void net_rx_action(struct softirq_action *h)
 	struct softnet_data *sd = &__get_cpu_var(softnet_data);
 	unsigned long time_limit = jiffies + 2;
 	int budget = netdev_budget;
-	LIST_HEAD(list);
-	LIST_HEAD(repoll);
 	void *have;
 
 	local_irq_disable();
-	list_splice_init(&sd->poll_list, &list);
-	local_irq_enable();
 
-	while (!list_empty(&list)) {
+	while (!list_empty(&sd->poll_list)) {
 		struct napi_struct *n;
 		int work, weight;
 
-		/* If softirq window is exhausted then punt.
+		/* If softirq window is exhuasted then punt.
 		 * Allow this to run for 2 jiffies since which will allow
 		 * an average latency of 1.5/HZ.
 		 */
 		if (unlikely(budget <= 0 || time_after_eq(jiffies, time_limit)))
 			goto softnet_break;
 
+		local_irq_enable();
 
-		n = list_first_entry(&list, struct napi_struct, poll_list);
-		list_del_init(&n->poll_list);
+		/* Even though interrupts have been re-enabled, this
+		 * access is safe because interrupts can only add new
+		 * entries to the tail of this list, and only ->poll()
+		 * calls can remove this head entry from the list.
+		 */
+		n = list_first_entry(&sd->poll_list, struct napi_struct, poll_list);
 
 		have = netpoll_poll_lock(n);
 
@@ -4273,6 +4250,8 @@ static void net_rx_action(struct softirq_action *h)
 
 		budget -= work;
 
+		local_irq_disable();
+
 		/* Drivers must not modify the NAPI state if they
 		 * consume the entire weight.  In such cases this code
 		 * still "owns" the NAPI instance and therefore can
@@ -4280,34 +4259,25 @@ static void net_rx_action(struct softirq_action *h)
 		 */
 		if (unlikely(work == weight)) {
 			if (unlikely(napi_disable_pending(n))) {
+				local_irq_enable();
 				napi_complete(n);
+				local_irq_disable();
 			} else {
 				if (n->gro_list) {
 					/* flush too old packets
 					 * If HZ < 1000, flush all packets.
 					 */
+					local_irq_enable();
 					napi_gro_flush(n, HZ >= 1000);
+					local_irq_disable();
 				}
-				list_add_tail(&n->poll_list, &repoll);
+				list_move_tail(&n->poll_list, &sd->poll_list);
 			}
 		}
 
 		netpoll_poll_unlock(have);
 	}
-
-	if (!sd_has_rps_ipi_waiting(sd) &&
-	    list_empty(&list) &&
-	    list_empty(&repoll))
-		return;
 out:
-	local_irq_disable();
-
-	list_splice_tail_init(&sd->poll_list, &list);
-	list_splice_tail(&repoll, &list);
-	list_splice(&list, &sd->poll_list);
-	if (!list_empty(&sd->poll_list))
-		__raise_softirq_irqoff(NET_RX_SOFTIRQ);
-
 	net_rps_action_and_irq_enable(sd);
 
 #ifdef CONFIG_NET_DMA
@@ -4322,6 +4292,7 @@ out:
 
 softnet_break:
 	sd->time_squeeze++;
+	__raise_softirq_irqoff(NET_RX_SOFTIRQ);
 	goto out;
 }
 
@@ -6092,8 +6063,8 @@ static int dev_cpu_callback(struct notifier_block *nfb,
 	 */
 	while (!list_empty(&oldsd->poll_list)) {
 		struct napi_struct *napi = list_first_entry(&oldsd->poll_list,
-							struct napi_struct,
-							poll_list);
+							    struct napi_struct,
+							    poll_list);
 
 		list_del_init(&napi->poll_list);
 		if (napi->poll == process_backlog)
@@ -6107,11 +6078,11 @@ static int dev_cpu_callback(struct notifier_block *nfb,
 
 	/* Process offline CPU's input_pkt_queue */
 	while ((skb = __skb_dequeue(&oldsd->process_queue))) {
-		kfree_skb(skb);
+		netif_rx(skb);
 		input_queue_head_incr(oldsd);
 	}
 	while ((skb = skb_dequeue(&oldsd->input_pkt_queue))) {
-		kfree_skb(skb);
+		netif_rx(skb);
 		input_queue_head_incr(oldsd);
 	}
 
@@ -6425,7 +6396,7 @@ static int __init net_dev_init(void)
 	open_softirq(NET_RX_SOFTIRQ, net_rx_action);
 
 	hotcpu_notifier(dev_cpu_callback, 0);
-	dst_init();
+	dst_subsys_init();
 	rc = 0;
 out:
 	return rc;

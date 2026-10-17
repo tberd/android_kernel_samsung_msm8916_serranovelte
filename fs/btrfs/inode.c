@@ -4542,7 +4542,7 @@ static int btrfs_setsize(struct inode *inode, struct iattr *attr)
 	}
 
 	if (newsize > oldsize) {
-		truncate_pagecache(inode, oldsize, newsize);
+		truncate_pagecache(inode, newsize);
 		ret = btrfs_cont_expand(inode, oldsize, newsize);
 		if (ret)
 			return ret;
@@ -4646,7 +4646,7 @@ void btrfs_evict_inode(struct inode *inode)
 
 	trace_btrfs_inode_evict(inode);
 
-	truncate_inode_pages(&inode->i_data, 0);
+	truncate_inode_pages_final(&inode->i_data);
 	if (inode->i_nlink && (btrfs_root_refs(&root->root_item) != 0 ||
 			       btrfs_is_free_space_inode(inode)))
 		goto no_delete;
@@ -7543,7 +7543,8 @@ static int btrfs_releasepage(struct page *page, gfp_t gfp_flags)
 	return __btrfs_releasepage(page, gfp_flags & GFP_NOFS);
 }
 
-static void btrfs_invalidatepage(struct page *page, unsigned long offset)
+static void btrfs_invalidatepage(struct page *page, unsigned int offset,
+				 unsigned int length)
 {
 	struct inode *inode = page->mapping->host;
 	struct extent_io_tree *tree;

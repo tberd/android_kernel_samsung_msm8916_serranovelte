@@ -1839,6 +1839,9 @@ long __get_user_pages(struct task_struct *tsk, struct mm_struct *mm,
 				int ret;
 				unsigned int fault_flags = 0;
 
+				/* mlock all present pages, but do not fault in new pages */
+				if ((foll_flags & (FOLL_POPULATE | FOLL_MLOCK)) == FOLL_MLOCK)
+					goto next_page;
 				if (foll_flags & FOLL_WRITE)
 					fault_flags |= FAULT_FLAG_WRITE;
 				if (nonblocking)

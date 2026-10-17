@@ -62,6 +62,7 @@
 #include <linux/capability.h>
 #include <linux/binfmts.h>
 #include <linux/sched/sysctl.h>
+#include <linux/bpf.h>
 
 #include <asm/uaccess.h>
 #include <asm/processor.h>
@@ -95,6 +96,8 @@
 #if defined(CONFIG_SYSCTL)
 
 /* External variables not in a header file. */
+extern int sysctl_lazy_vfree_pages;
+extern int sysctl_lazy_vfree_tlb_flush_all_threshold;
 extern int sysctl_overcommit_memory;
 extern int sysctl_overcommit_ratio;
 extern int max_threads;
@@ -133,6 +136,9 @@ static unsigned long one_ul = 1;
 static int one_hundred = 100;
 #ifdef CONFIG_PRINTK
 static int ten_thousand = 10000;
+#endif
+#ifdef CONFIG_PERF_EVENTS
+static int six_hundred_forty_kb = 640 * 1024;
 #endif
 
 /* this is needed for the proc_doulongvec_minmax of vm_dirty_bytes */
@@ -218,6 +224,28 @@ static int sysrq_sysctl_handler(ctl_table *table, int write,
 
 #endif
 
+#ifdef CONFIG_BPF_SYSCALL
+static int bpf_unpriv_handler(struct ctl_table *table, int write,
+                             void *buffer, size_t *lenp, loff_t *ppos)
+{
+	int ret, unpriv_enable = *(int *)table->data;
+	bool locked_state = unpriv_enable == 1;
+	struct ctl_table tmp = *table;
+
+	if (write && !capable(CAP_SYS_ADMIN))
+		return -EPERM;
+
+	tmp.data = &unpriv_enable;
+	ret = proc_dointvec_minmax(&tmp, write, buffer, lenp, ppos);
+	if (write && !ret) {
+		if (locked_state && unpriv_enable != 1)
+			return -EPERM;
+		*(int *)table->data = unpriv_enable;
+	}
+	return ret;
+}
+#endif
+
 static struct ctl_table kern_table[];
 static struct ctl_table vm_table[];
 static struct ctl_table fs_table[];
@@ -287,167 +315,6 @@ static struct ctl_table kern_table[] = {
 		.mode		= 0644,
 		.proc_handler	= proc_dointvec,
 	},
-	{
-		.procname	= "sched_wake_to_idle",
-		.data		= &sysctl_sched_wake_to_idle,
-		.maxlen		= sizeof(unsigned int),
-		.mode		= 0644,
-		.proc_handler	= proc_dointvec,
-	},
-	{
-		.procname	= "sched_wakeup_load_threshold",
-		.data		= &sysctl_sched_wakeup_load_threshold,
-		.maxlen		= sizeof(unsigned int),
-		.mode		= 0644,
-		.proc_handler	= proc_dointvec,
-	},
-#ifdef CONFIG_SCHED_FREQ_INPUT
-	{
-		.procname	= "sched_freq_inc_notify",
-		.data		= &sysctl_sched_freq_inc_notify,
-		.maxlen		= sizeof(unsigned int),
-		.mode		= 0644,
-		.proc_handler	= proc_dointvec_minmax,
-		.extra1		= &zero,
-	},
-	{
-		.procname	= "sched_freq_dec_notify",
-		.data		= &sysctl_sched_freq_dec_notify,
-		.maxlen		= sizeof(unsigned int),
-		.mode		= 0644,
-		.proc_handler	= proc_dointvec_minmax,
-		.extra1		= &zero,
-	},
-	{
-		.procname       = "sched_migration_fixup",
-		.data           = &sysctl_sched_migration_fixup,
-		.maxlen         = sizeof(unsigned int),
-		.mode           = 0644,
-		.proc_handler   = sched_window_update_handler,
-	},
-	{
-		.procname       = "sched_freq_account_wait_time",
-		.data           = &sysctl_sched_freq_account_wait_time,
-		.maxlen         = sizeof(unsigned int),
-		.mode           = 0644,
-		.proc_handler   = sched_window_update_handler,
-	},
-	{
-		.procname       = "sched_heavy_task",
-		.data           = &sysctl_sched_heavy_task_pct,
-		.maxlen         = sizeof(unsigned int),
-		.mode           = 0644,
-		.proc_handler   = sched_hmp_proc_update_handler,
-	},
-#endif
-#ifdef CONFIG_SCHED_HMP
-	{
-		.procname       = "sched_account_wait_time",
-		.data           = &sysctl_sched_account_wait_time,
-		.maxlen         = sizeof(unsigned int),
-		.mode           = 0644,
-		.proc_handler   = sched_window_update_handler,
-	},
-	{
-		.procname       = "sched_ravg_hist_size",
-		.data           = &sysctl_sched_ravg_hist_size,
-		.maxlen         = sizeof(unsigned int),
-		.mode           = 0644,
-		.proc_handler   = sched_window_update_handler,
-	},
-	{
-		.procname       = "sched_window_stats_policy",
-		.data           = &sysctl_sched_window_stats_policy,
-		.maxlen         = sizeof(unsigned int),
-		.mode           = 0644,
-		.proc_handler   = sched_window_update_handler,
-	},
-	{
-		.procname	= "sched_small_task",
-		.data		= &sysctl_sched_small_task_pct,
-		.maxlen		= sizeof(unsigned int),
-		.mode		= 0644,
-		.proc_handler	= sched_hmp_proc_update_handler,
-	},
-	{
-		.procname	= "sched_mostly_idle_load",
-		.data		= &sysctl_sched_mostly_idle_load_pct,
-		.maxlen		= sizeof(unsigned int),
-		.mode		= 0644,
-		.proc_handler	= sched_hmp_proc_update_handler,
-	},
-	{
-		.procname	= "sched_mostly_idle_nr_run",
-		.data		= &sysctl_sched_mostly_idle_nr_run,
-		.maxlen		= sizeof(unsigned int),
-		.mode		= 0644,
-		.proc_handler	= proc_dointvec,
-	},
-	{
-		.procname	= "sched_spill_load",
-		.data		= &sysctl_sched_spill_load_pct,
-		.maxlen		= sizeof(unsigned int),
-		.mode		= 0644,
-		.proc_handler	= sched_hmp_proc_update_handler,
-	},
-	{
-		.procname	= "sched_spill_nr_run",
-		.data		= &sysctl_sched_spill_nr_run,
-		.maxlen		= sizeof(unsigned int),
-		.mode		= 0644,
-		.proc_handler	= proc_dointvec_minmax,
-		.extra1		= &zero,
-	},
-	{
-		.procname	= "sched_upmigrate",
-		.data		= &sysctl_sched_upmigrate_pct,
-		.maxlen		= sizeof(unsigned int),
-		.mode		= 0644,
-		.proc_handler	= sched_hmp_proc_update_handler,
-	},
-	{
-		.procname	= "sched_downmigrate",
-		.data		= &sysctl_sched_downmigrate_pct,
-		.maxlen		= sizeof(unsigned int),
-		.mode		= 0644,
-		.proc_handler	= sched_hmp_proc_update_handler,
-	},
-	{
-		.procname	= "sched_upmigrate_min_nice",
-		.data		= &sysctl_sched_upmigrate_min_nice,
-		.maxlen		= sizeof(unsigned int),
-		.mode		= 0644,
-		.proc_handler	= sched_hmp_proc_update_handler,
-	},
-	{
-		.procname	= "sched_prefer_idle",
-		.data		= &sysctl_sched_prefer_idle,
-		.maxlen		= sizeof(unsigned int),
-		.mode		= 0644,
-		.proc_handler	= proc_dointvec,
-	},
-	{
-		.procname	= "sched_init_task_load",
-		.data		= &sysctl_sched_init_task_load_pct,
-		.maxlen		= sizeof(unsigned int),
-		.mode		= 0644,
-		.proc_handler	= sched_hmp_proc_update_handler,
-	},
-	{
-		.procname	= "sched_power_band_limit",
-		.data		= &sysctl_sched_powerband_limit_pct,
-		.maxlen		= sizeof(unsigned int),
-		.mode		= 0644,
-		.proc_handler	= sched_hmp_proc_update_handler,
-	},
-	{
-		.procname	= "sched_boost",
-		.data		= &sysctl_sched_boost,
-		.maxlen		= sizeof(unsigned int),
-		.mode		= 0644,
-		.proc_handler	= sched_boost_handler,
-	},
-#endif	/* CONFIG_SCHED_HMP */
 #ifdef CONFIG_SCHED_DEBUG
 	{
 		.procname	= "sched_min_granularity_ns",
@@ -475,6 +342,20 @@ static struct ctl_table kern_table[] = {
 		.proc_handler	= sched_proc_update_handler,
 		.extra1		= &min_wakeup_granularity_ns,
 		.extra2		= &max_wakeup_granularity_ns,
+	},
+	{
+		.procname	= "sched_yield_sleep_threshold",
+		.data		= &sysctl_sched_yield_sleep_threshold,
+		.maxlen		= sizeof(int),
+		.mode		= 0644,
+		.proc_handler	= proc_dointvec,
+	},
+	{
+		.procname	= "sched_yield_sleep_duration",
+		.data		= &sysctl_sched_yield_sleep_duration,
+		.maxlen		= sizeof(unsigned int),
+		.mode		= 0644,
+		.proc_handler	= proc_dointvec,
 	},
 #ifdef CONFIG_SMP
 	{
@@ -906,7 +787,7 @@ static struct ctl_table kern_table[] = {
 	{
 		.procname	= "printk",
 		.data		= &console_loglevel,
-		.maxlen		= 4*sizeof(int),
+		.maxlen		= 5*sizeof(int),
 		.mode		= 0644,
 		.proc_handler	= proc_dointvec,
 	},
@@ -1223,6 +1104,15 @@ static struct ctl_table kern_table[] = {
 		.extra1		= &zero,
 		.extra2		= &one_hundred,
 	},
+	{
+		.procname	= "perf_event_max_stack",
+		.data		= NULL, /* filled in by handler */
+		.maxlen		= sizeof(sysctl_perf_event_max_stack),
+		.mode		= 0644,
+		.proc_handler	= perf_event_max_stack_handler,
+		.extra1		= &zero,
+		.extra2		= &six_hundred_forty_kb,
+	},
 #endif
 #ifdef CONFIG_KMEMCHECK
 	{
@@ -1242,31 +1132,35 @@ static struct ctl_table kern_table[] = {
 		.proc_handler	= proc_dointvec,
 	},
 #endif
-#if defined(CONFIG_ARM) || defined(CONFIG_ARM64)
+#ifdef CONFIG_BPF_SYSCALL
 	{
-		.procname	= "boot_reason",
-		.data		= &boot_reason,
-		.maxlen		= sizeof(int),
-		.mode		= 0444,
-		.proc_handler	= proc_dointvec,
-	},
-
-	{
-		.procname	= "cold_boot",
-		.data		= &cold_boot,
-		.maxlen		= sizeof(int),
-		.mode		= 0444,
-		.proc_handler	= proc_dointvec,
+		.procname	= "unprivileged_bpf_disabled",
+		.data		= &sysctl_unprivileged_bpf_disabled,
+		.maxlen		= sizeof(sysctl_unprivileged_bpf_disabled),
+		.mode		= 0644,
+		.proc_handler	= bpf_unpriv_handler,
+		.extra1		= &zero,
+		.extra2		= &two,
 	},
 #endif
-/*
- * NOTE: do not add new entries to this table unless you have read
- * Documentation/sysctl/ctl_unnumbered.txt
- */
 	{ }
 };
 
 static struct ctl_table vm_table[] = {
+	{
+		.procname	= "lazy_vfree_pages",
+		.data		= &sysctl_lazy_vfree_pages,
+		.maxlen		= sizeof(sysctl_lazy_vfree_pages),
+		.mode		= 0644,
+		.proc_handler	= proc_dointvec,
+	},
+	{
+		.procname	= "lazy_vfree_tlb_flush_all_threshold",
+		.data		= &sysctl_lazy_vfree_tlb_flush_all_threshold,
+		.maxlen		= sizeof(sysctl_lazy_vfree_tlb_flush_all_threshold),
+		.mode		= 0644,
+		.proc_handler	= proc_dointvec,
+	},
 	{
 		.procname	= "overcommit_memory",
 		.data		= &sysctl_overcommit_memory,
@@ -1410,7 +1304,7 @@ static struct ctl_table vm_table[] = {
 		.data		= &hugepages_treat_as_movable,
 		.maxlen		= sizeof(int),
 		.mode		= 0644,
-		.proc_handler	= hugetlb_treat_movable_handler,
+		.proc_handler	= proc_dointvec,
 	},
 	{
 		.procname	= "nr_overcommit_hugepages",
@@ -1617,6 +1511,13 @@ static struct ctl_table vm_table[] = {
 		.extra2		= &one,
 	},
 #endif
+	{
+		.procname	= "scan_unevictable_pages",
+		.data		= &scan_unevictable_pages,
+		.maxlen		= sizeof(scan_unevictable_pages),
+		.mode		= 0644,
+		.proc_handler	= scan_unevictable_handler,
+	},
 #ifdef CONFIG_MEMORY_FAILURE
 	{
 		.procname	= "memory_failure_early_kill",
@@ -1686,14 +1587,14 @@ static struct ctl_table fs_table[] = {
 	{
 		.procname	= "inode-nr",
 		.data		= &inodes_stat,
-		.maxlen		= 2*sizeof(int),
+		.maxlen		= 2*sizeof(long),
 		.mode		= 0444,
 		.proc_handler	= proc_nr_inodes,
 	},
 	{
 		.procname	= "inode-state",
 		.data		= &inodes_stat,
-		.maxlen		= 7*sizeof(int),
+		.maxlen		= 7*sizeof(long),
 		.mode		= 0444,
 		.proc_handler	= proc_nr_inodes,
 	},
@@ -1723,7 +1624,7 @@ static struct ctl_table fs_table[] = {
 	{
 		.procname	= "dentry-state",
 		.data		= &dentry_stat,
-		.maxlen		= 6*sizeof(int),
+		.maxlen		= 6*sizeof(long),
 		.mode		= 0444,
 		.proc_handler	= proc_nr_dentry,
 	},

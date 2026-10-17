@@ -247,7 +247,7 @@ static int debugfs_show_options(struct seq_file *m, struct dentry *root)
 
 static void debugfs_evict_inode(struct inode *inode)
 {
-	truncate_inode_pages(&inode->i_data, 0);
+	truncate_inode_pages_final(&inode->i_data);
 	clear_inode(inode);
 	if (S_ISLNK(inode->i_mode))
 		kfree(inode->i_private);
@@ -619,7 +619,7 @@ struct dentry *debugfs_rename(struct dentry *old_dir, struct dentry *old_dentry,
 	take_dentry_name_snapshot(&old_name, old_dentry);
 
 	error = simple_rename(old_dir->d_inode, old_dentry, new_dir->d_inode,
-		dentry);
+		dentry, 0);
 	if (error) {
 		release_dentry_name_snapshot(&old_name);
 		goto exit;

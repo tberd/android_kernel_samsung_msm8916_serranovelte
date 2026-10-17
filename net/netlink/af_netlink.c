@@ -572,7 +572,7 @@ static void netlink_ring_setup_skb(struct sk_buff *skb, struct sock *sk,
 
 static int netlink_mmap_sendmsg(struct sock *sk, struct msghdr *msg,
 				u32 dst_portid, u32 dst_group,
-				struct sock_iocb *siocb)
+				struct scm_cookie *scm)
 {
 	struct netlink_sock *nlk = nlk_sk(sk);
 	struct netlink_ring *ring;
@@ -618,7 +618,7 @@ static int netlink_mmap_sendmsg(struct sock *sk, struct msghdr *msg,
 
 		NETLINK_CB(skb).portid	  = nlk->portid;
 		NETLINK_CB(skb).dst_group = dst_group;
-		NETLINK_CB(skb).creds	  = siocb->scm->creds;
+		NETLINK_CB(skb).creds	  = scm->creds;
 
 		err = security_netlink_send(sk, skb);
 		if (err) {
@@ -697,7 +697,7 @@ static void netlink_ring_set_copied(struct sock *sk, struct sk_buff *skb)
 #define netlink_tx_is_mmaped(sk)	false
 #define netlink_mmap			sock_no_mmap
 #define netlink_poll			datagram_poll
-#define netlink_mmap_sendmsg(sk, msg, dst_portid, dst_group, siocb)	0
+#define netlink_mmap_sendmsg(sk, msg, dst_portid, dst_group, scm)	0
 #endif /* CONFIG_NETLINK_MMAP */
 
 static void netlink_skb_destructor(struct sk_buff *skb)
@@ -2112,10 +2112,8 @@ static void netlink_cmsg_recv_pktinfo(struct msghdr *msg, struct sk_buff *skb)
 	put_cmsg(msg, SOL_NETLINK, NETLINK_PKTINFO, sizeof(info), &info);
 }
 
-static int netlink_sendmsg(struct kiocb *kiocb, struct socket *sock,
-			   struct msghdr *msg, size_t len)
+static int netlink_sendmsg(struct socket *sock, struct msghdr *msg, size_t len)
 {
-	struct sock_iocb *siocb = kiocb_to_siocb(kiocb);
 	struct sock *sk = sock->sk;
 	struct netlink_sock *nlk = nlk_sk(sk);
 	struct sockaddr_nl *addr = msg->msg_name;
@@ -2129,10 +2127,7 @@ static int netlink_sendmsg(struct kiocb *kiocb, struct socket *sock,
 	if (msg->msg_flags&MSG_OOB)
 		return -EOPNOTSUPP;
 
-	if (NULL == siocb->scm)
-		siocb->scm = &scm;
-
-	err = scm_send(sock, msg, siocb->scm, true);
+	err = scm_send(sock, msg, &scm, true);
 	if (err < 0)
 		return err;
 
@@ -2161,7 +2156,7 @@ static int netlink_sendmsg(struct kiocb *kiocb, struct socket *sock,
 	if (netlink_tx_is_mmaped(sk) &&
 	    msg->msg_iov->iov_base == NULL) {
 		err = netlink_mmap_sendmsg(sk, msg, dst_portid, dst_group,
-					   siocb);
+					   &scm);
 		goto out;
 	}
 
@@ -2175,11 +2170,11 @@ static int netlink_sendmsg(struct kiocb *kiocb, struct socket *sock,
 
 	NETLINK_CB(skb).portid	= nlk->portid;
 	NETLINK_CB(skb).dst_group = dst_group;
-	NETLINK_CB(skb).creds	= siocb->scm->creds;
+	NETLINK_CB(skb).creds	= scm.creds;
 	NETLINK_CB(skb).flags	= netlink_skb_flags;
 
 	err = -EFAULT;
-	if (memcpy_fromiovec(skb_put(skb, len), msg->msg_iov, len)) {
+	if (memcpy_from_msg(skb_put(skb, len), msg, len)) {
 		kfree_skb(skb);
 		goto out;
 	}
@@ -2197,15 +2192,13 @@ static int netlink_sendmsg(struct kiocb *kiocb, struct socket *sock,
 	err = netlink_unicast(sk, skb, dst_portid, msg->msg_flags&MSG_DONTWAIT);
 
 out:
-	scm_destroy(siocb->scm);
+	scm_destroy(&scm);
 	return err;
 }
 
-static int netlink_recvmsg(struct kiocb *kiocb, struct socket *sock,
-			   struct msghdr *msg, size_t len,
+static int netlink_recvmsg(struct socket *sock, struct msghdr *msg, size_t len,
 			   int flags)
 {
-	struct sock_iocb *siocb = kiocb_to_siocb(kiocb);
 	struct scm_cookie scm;
 	struct sock *sk = sock->sk;
 	struct netlink_sock *nlk = nlk_sk(sk);
@@ -2263,11 +2256,8 @@ static int netlink_recvmsg(struct kiocb *kiocb, struct socket *sock,
 	if (nlk->flags & NETLINK_RECV_PKTINFO)
 		netlink_cmsg_recv_pktinfo(msg, skb);
 
-	if (NULL == siocb->scm) {
-		memset(&scm, 0, sizeof(scm));
-		siocb->scm = &scm;
-	}
-	siocb->scm->creds = *NETLINK_CREDS(skb);
+	memset(&scm, 0, sizeof(scm));
+	scm.creds = *NETLINK_CREDS(skb);
 	if (flags & MSG_TRUNC)
 		copied = data_skb->len;
 
@@ -2282,7 +2272,7 @@ static int netlink_recvmsg(struct kiocb *kiocb, struct socket *sock,
 		}
 	}
 
-	scm_recv(sock, msg, siocb->scm, flags);
+	scm_recv(sock, msg, &scm, flags);
 out:
 	netlink_rcv_wake(sk);
 	return err ? : copied;

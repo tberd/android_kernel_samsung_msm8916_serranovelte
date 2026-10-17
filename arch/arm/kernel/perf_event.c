@@ -5,6 +5,7 @@
  *
  * Copyright (C) 2009 picoChip Designs, Ltd., Jamie Iles
  * Copyright (C) 2010 ARM Ltd., Will Deacon <will.deacon@arm.com>
+ * Copyright (c) 2012-2013, NVIDIA CORPORATION.  All rights reserved.
  *
  * This code is based on the sparc64 perf event code, which is in turn based
  * on the x86 code. Callchain code is based on the ARM OProfile backtrace
@@ -16,14 +17,13 @@
 #include <linux/platform_device.h>
 #include <linux/pm_runtime.h>
 #include <linux/uaccess.h>
-#include <linux/irq.h>
 
 #include <asm/irq_regs.h>
 #include <asm/pmu.h>
 #include <asm/stacktrace.h>
 
 static int
-armpmu_map_cache_event(unsigned (*cache_map)
+armpmu_map_cache_event(const unsigned (*cache_map)
 				      [PERF_COUNT_HW_CACHE_MAX]
 				      [PERF_COUNT_HW_CACHE_OP_MAX]
 				      [PERF_COUNT_HW_CACHE_RESULT_MAX],
@@ -72,7 +72,7 @@ armpmu_map_raw_event(u32 raw_event_mask, u64 config)
 int
 armpmu_map_event(struct perf_event *event,
 		 const unsigned (*event_map)[PERF_COUNT_HW_MAX],
-		 unsigned (*cache_map)
+		 const unsigned (*cache_map)
 				[PERF_COUNT_HW_CACHE_MAX]
 				[PERF_COUNT_HW_CACHE_OP_MAX]
 				[PERF_COUNT_HW_CACHE_RESULT_MAX],
@@ -135,9 +135,6 @@ u64 armpmu_event_update(struct perf_event *event)
 	struct arm_pmu *armpmu = to_arm_pmu(event->pmu);
 	struct hw_perf_event *hwc = &event->hw;
 	u64 delta, prev_raw_count, new_raw_count;
-
-	if (event->state <= PERF_EVENT_STATE_OFF)
-		return 0;
 
 again:
 	prev_raw_count = local64_read(&hwc->prev_count);
@@ -214,10 +211,6 @@ armpmu_del(struct perf_event *event, int flags)
 	hw_events->events[idx] = NULL;
 	clear_bit(idx, hw_events->used_mask);
 
-	/* Clear event constraints. */
-	if (armpmu->clear_event_constraints)
-		armpmu->clear_event_constraints(event);
-
 	perf_event_update_userpage(event);
 }
 
@@ -231,18 +224,6 @@ armpmu_add(struct perf_event *event, int flags)
 	int err = 0;
 
 	perf_pmu_disable(event->pmu);
-	/*
-	 * Tests if event is constrained. If not sets it so that next
-	 * collision can be detected.
-	 */
-	if (armpmu->test_set_event_constraints)
-		if (armpmu->test_set_event_constraints(event) < 0) {
-			pr_err("Event: %llx failed constraint check.\n",
-					event->attr.config);
-			event->state = PERF_EVENT_STATE_OFF;
-			err = -EPERM;
-			goto out;
-		}
 
 	/* If we don't have a space for the counter then finish early. */
 	idx = armpmu->get_event_idx(hw_events, event);
@@ -272,30 +253,21 @@ out:
 }
 
 static int
-validate_event(struct pmu *pmu, struct pmu_hw_events *hw_events,
-			       struct perf_event *event)
+validate_event(struct pmu_hw_events *hw_events,
+	       struct perf_event *event)
 {
-	struct arm_pmu *armpmu;
+	struct arm_pmu *armpmu = to_arm_pmu(event->pmu);
 	struct pmu *leader_pmu = event->group_leader->pmu;
 
 	if (is_software_event(event))
 		return 1;
 
-	/*
-	 * Reject groups spanning multiple HW PMUs (e.g. CPU + CCI). The
-	 * core perf code won't check that the pmu->ctx == leader->ctx
-	 * until after pmu->event_init(event).
-	 */
-	if (event->pmu != pmu)
-		return 0;
-
-        if (event->pmu != leader_pmu || event->state < PERF_EVENT_STATE_OFF)
+	if (event->pmu != leader_pmu || event->state < PERF_EVENT_STATE_OFF)
 		return 1;
 
 	if (event->state == PERF_EVENT_STATE_OFF && !event->attr.enable_on_exec)
 		return 1;
 
-	armpmu = to_arm_pmu(event->pmu);
 	return armpmu->get_event_idx(hw_events, event) >= 0;
 }
 
@@ -313,15 +285,15 @@ validate_group(struct perf_event *event)
 	memset(fake_used_mask, 0, sizeof(fake_used_mask));
 	fake_pmu.used_mask = fake_used_mask;
 
-	if (!validate_event(event->pmu, &fake_pmu, leader))
+	if (!validate_event(&fake_pmu, leader))
 		return -EINVAL;
 
 	list_for_each_entry(sibling, &leader->sibling_list, group_entry) {
-		if (!validate_event(event->pmu, &fake_pmu, sibling))
+		if (!validate_event(&fake_pmu, sibling))
 			return -EINVAL;
 	}
 
-	if (!validate_event(event->pmu, &fake_pmu, event))
+	if (!validate_event(&fake_pmu, event))
 		return -EINVAL;
 
 	return 0;
@@ -329,7 +301,7 @@ validate_group(struct perf_event *event)
 
 static irqreturn_t armpmu_dispatch_irq(int irq, void *dev)
 {
-	struct arm_pmu *armpmu = *(struct arm_pmu **) dev;
+	struct arm_pmu *armpmu = (struct arm_pmu *) dev;
 	struct platform_device *plat_device = armpmu->plat_device;
 	struct arm_pmu_platdata *plat = dev_get_platdata(&plat_device->dev);
 	int ret;
@@ -337,76 +309,37 @@ static irqreturn_t armpmu_dispatch_irq(int irq, void *dev)
 
 	start_clock = sched_clock();
 	if (plat && plat->handle_irq)
-		ret = plat->handle_irq(irq, armpmu, armpmu->handle_irq);
+		ret = plat->handle_irq(irq, dev, armpmu->handle_irq);
 	else
-		ret = armpmu->handle_irq(irq, armpmu);
+		ret = armpmu->handle_irq(irq, dev);
 	finish_clock = sched_clock();
 
 	perf_sample_event_took(finish_clock - start_clock);
 	return ret;
 }
 
-static int
-armpmu_generic_request_irq(int irq, irq_handler_t *handle_irq, void *dev_id)
-{
-        return request_irq(irq, *handle_irq,
-                        IRQF_DISABLED | IRQF_NOBALANCING,
-                        "arm-pmu", dev_id);
-}
-
-static void
-armpmu_generic_free_irq(int irq, void *dev_id)
-{
-        if (irq >= 0)
-                free_irq(irq, dev_id);
-}
-
 static void
 armpmu_release_hardware(struct arm_pmu *armpmu)
 {
-	/*
-	 * If a cpu comes online during this function, do not enable its irq.
-	 * If a cpu goes offline, it should disable its irq.
-	 */
-	armpmu->pmu_state = ARM_PMU_STATE_GOING_DOWN;
 	armpmu->free_irq(armpmu);
 	pm_runtime_put_sync(&armpmu->plat_device->dev);
-	armpmu->pmu_state = ARM_PMU_STATE_OFF;
 }
 
 static int
 armpmu_reserve_hardware(struct arm_pmu *armpmu)
 {
 	int err;
-	int cpu;
-	struct arm_pmu_platdata *plat;
 	struct platform_device *pmu_device = armpmu->plat_device;
 
 	if (!pmu_device)
 		return -ENODEV;
 
 	pm_runtime_get_sync(&pmu_device->dev);
-
-	plat = dev_get_platdata(&pmu_device->dev);
-	if (plat && plat->request_pmu_irq)
-		armpmu->request_pmu_irq = plat->request_pmu_irq;
-	else if (!armpmu->request_pmu_irq)
-		armpmu->request_pmu_irq = armpmu_generic_request_irq;
-
-	if (plat && plat->free_pmu_irq)
-		armpmu->free_pmu_irq = plat->free_pmu_irq;
-	else if (!armpmu->free_pmu_irq)
-		armpmu->free_pmu_irq = armpmu_generic_free_irq;
-
 	err = armpmu->request_irq(armpmu, armpmu_dispatch_irq);
 	if (err) {
 		armpmu_release_hardware(armpmu);
 		return err;
 	}
-	armpmu->pmu_state = ARM_PMU_STATE_RUNNING;
-	if (armpmu->reset)
-		for_each_cpu(cpu, cpu_online_mask)
-			smp_call_function_single(cpu, armpmu->reset, armpmu, 1);
 
 	return 0;
 }
@@ -467,7 +400,6 @@ __hw_perf_event_init(struct perf_event *event)
 			 "mode exclusion\n");
 		return -EOPNOTSUPP;
 	}
-
 
 	/*
 	 * Store the event encoding into the config_base field.
@@ -534,24 +466,6 @@ static void armpmu_enable(struct pmu *pmu)
 	struct arm_pmu *armpmu = to_arm_pmu(pmu);
 	struct pmu_hw_events *hw_events = armpmu->get_hw_events();
 	int enabled = bitmap_weight(hw_events->used_mask, armpmu->num_events);
-	int idx;
-
-	if (*hw_events->from_idle) {
-		for (idx = 0; idx <= armpmu->num_events; ++idx) {
-			struct perf_event *event = hw_events->events[idx];
-
-			if (!event)
-				continue;
-
-			armpmu->enable(event);
-		}
-
-		/* Reset bit so we don't needlessly re-enable counters.*/
-		*hw_events->from_idle = 0;
-	}
-
-	/* So we don't start the PMU before enabling counters after idle. */
-	barrier();
 
 	if (enabled)
 		armpmu->start(armpmu);
@@ -594,14 +508,16 @@ static void armpmu_init(struct arm_pmu *armpmu)
 	atomic_set(&armpmu->active_events, 0);
 	mutex_init(&armpmu->reserve_mutex);
 
-	armpmu->pmu.pmu_enable = armpmu_enable;
-	armpmu->pmu.pmu_disable = armpmu_disable;
-	armpmu->pmu.event_init = armpmu_event_init;
-	armpmu->pmu.add = armpmu_add;
-	armpmu->pmu.del = armpmu_del;
-	armpmu->pmu.start = armpmu_start;
-	armpmu->pmu.stop = armpmu_stop;
-	armpmu->pmu.read = armpmu_read;
+	armpmu->pmu = (struct pmu) {
+		.pmu_enable	= armpmu_enable,
+		.pmu_disable	= armpmu_disable,
+		.event_init	= armpmu_event_init,
+		.add		= armpmu_add,
+		.del		= armpmu_del,
+		.start		= armpmu_start,
+		.stop		= armpmu_stop,
+		.read		= armpmu_read,
+	};
 }
 
 int armpmu_register(struct arm_pmu *armpmu, int type)
@@ -625,11 +541,18 @@ int armpmu_register(struct arm_pmu *armpmu, int type)
  *
  * This code has been adapted from the ARM OProfile support.
  */
+#ifndef CONFIG_PERF_ANDROID_BACKTRACE
 struct frame_tail {
 	struct frame_tail __user *fp;
 	unsigned long sp;
 	unsigned long lr;
-} __attribute__((packed));
+} __packed;
+#else
+struct frame_tail {
+	unsigned long fp;
+	unsigned long lr;
+} __packed;
+#endif
 
 /*
  * Get the return address for a single stackframe and return a pointer to the
@@ -637,7 +560,7 @@ struct frame_tail {
  */
 static struct frame_tail __user *
 user_backtrace(struct frame_tail __user *tail,
-	       struct perf_callchain_entry *entry)
+	       struct perf_callchain_entry_ctx *entry)
 {
 	struct frame_tail buftail;
 
@@ -649,6 +572,7 @@ user_backtrace(struct frame_tail __user *tail,
 
 	perf_callchain_store(entry, buftail.lr);
 
+#ifndef CONFIG_PERF_ANDROID_BACKTRACE
 	/*
 	 * Frame pointers should strictly progress back up the stack
 	 * (towards higher addresses).
@@ -657,10 +581,235 @@ user_backtrace(struct frame_tail __user *tail,
 		return NULL;
 
 	return buftail.fp - 1;
+#else
+	/*
+	 * Frame pointers should strictly progress back up the stack
+	 * (towards higher addresses).
+	 */
+	if ((unsigned long *)(tail + 1) >= (unsigned long *)buftail.fp)
+		return NULL;
+
+	return  (struct frame_tail *)(buftail.fp - sizeof(unsigned long));
+#endif
 }
 
+
+#ifdef CONFIG_PERF_ANDROID_BACKTRACE
+
+#define AB_USER_SPACE_MIN_ADDR	0x8000
+#define PERF_CALLCHAIN_CHECK_PROLOG_EPILOG 1
+
+#ifdef PERF_CALLCHAIN_CHECK_PROLOG_EPILOG
+
+enum regs {
+#ifdef CONFIG_THUMB2_KERNEL
+	FP = 7,
+#else
+	FP = 11,
+#endif
+	SP = 13,
+	LR = 14,
+	PC = 15
+};
+
+#define INSTR_MASK_STR_FP	0xffff0000
+#define INSTR_STR_FP		0xe52d0000
+
+#define INSTR_MASK_STMDB	0xffff0000
+#define INSTR_STMDB_SP		0xe92d0000
+
+#define INSTR_MASK_LDMIA	0x0fff0000
+#define INSTR_LDMIA_SP		0x08bd0000
+
+#define INSTR_MASK_ADD_RN_RD	0xfffff000
+#define INSTR_ADD_FP_SP		0xe28db000
+
+#define INSTR_MASK_BRANCH	0x0f000000
+#define INSTR_BRANCH		0x0a000000
+
+#define INSTR_MASK_BRANCH_L	0x0f000000
+#define INSTR_BRANCH_L		0x0b000000
+
+#define INSTR_MASK_BRANCH_X	0x0ffffff0
+#define INSTR_BRANCH_X		0x012fff10
+
+#define INSTR_MASK_BRANCH_LX	0x0ffffff0
+#define INSTR_BRANCH_LX		0x012fff30
+
+#define check_in_register_list(val, reg) \
+	(((val) & 0xffff) & (1 << (reg)))
+
+static inline int is_instr_push_with_fp(unsigned long instr)
+{
+	if ((instr & INSTR_MASK_STMDB) == INSTR_STMDB_SP) {
+		if (check_in_register_list(instr, SP) ||
+			check_in_register_list(instr, PC)) {
+			return -1;
+		}
+		if (check_in_register_list(instr, FP))
+			return 1;
+	}
+
+	if ((instr & INSTR_MASK_STR_FP) == INSTR_STR_FP)
+		return 1;
+
+	return 0;
+}
+
+static inline int is_instr_push_with_fp_lr(unsigned long instr)
+{
+	if ((instr & INSTR_MASK_STMDB) == INSTR_STMDB_SP) {
+		if (check_in_register_list(instr, SP) ||
+			check_in_register_list(instr, PC)) {
+			return -1;
+		}
+		if (check_in_register_list(instr, FP) &&
+			check_in_register_list(instr, LR)) {
+			return 1;
+		}
+	}
+	return 0;
+}
+
+#define is_instr_add_fp(instr) \
+	((((instr) & INSTR_MASK_ADD_RN_RD) == INSTR_ADD_FP_SP))
+
+#define is_instr_pop(instr) \
+	((((instr) & INSTR_MASK_LDMIA) == INSTR_LDMIA_SP))
+
+#define is_instr_pop_fp(instr) \
+	((((instr) & INSTR_MASK_LDMIA) == INSTR_LDMIA_SP) && \
+	check_in_register_list(instr, FP)) \
+
+#define is_instr_branch(instr) \
+	((((instr) & INSTR_MASK_BRANCH) == INSTR_BRANCH) || \
+	(((instr) & INSTR_MASK_BRANCH_L) == INSTR_BRANCH_L) || \
+	(((instr) & INSTR_MASK_BRANCH_X) == INSTR_BRANCH_X) || \
+	(((instr) & INSTR_MASK_BRANCH_LX) == INSTR_BRANCH_LX))
+
+enum {
+	INSTR_TYPE_PUSH_FP,
+	INSTR_TYPE_PUSH_FP_LR,
+	INSTR_TYPE_ADD_FP,
+	INSTR_TYPE_POP,
+	INSTR_TYPE_POP_FP,
+	INSTR_TYPE_BRANCH,
+	INSTR_TYPE_UNKNOWN,
+};
+
+#define MAX_CHECK_INSTR_LENGTH	5
+
+static unsigned long instr_before[MAX_CHECK_INSTR_LENGTH];
+static int instr_before_nr;
+
+static unsigned long instr_after[MAX_CHECK_INSTR_LENGTH];
+static int instr_after_nr;
+
+static int read_instructions(unsigned long *addr, int direction)
+{
+	int i, delta, type, nr_instr = 0;
+	unsigned long instr, *c_addr = addr;
+	unsigned long *instr_p;
+
+	if (direction) {
+		delta = 1;
+		instr_p = instr_after;
+	} else {
+		delta = -1;
+		instr_p = instr_before;
+	}
+
+	for (i = 0; i < MAX_CHECK_INSTR_LENGTH; i++) {
+		if (get_user(instr, c_addr))
+			return -1;
+
+		type = INSTR_TYPE_UNKNOWN;
+		if (is_instr_push_with_fp(instr))
+			type = INSTR_TYPE_PUSH_FP;
+		else if (is_instr_push_with_fp_lr(instr))
+			type = INSTR_TYPE_PUSH_FP_LR;
+		else if (is_instr_add_fp(instr))
+			type = INSTR_TYPE_ADD_FP;
+		else if (is_instr_pop_fp(instr))
+			type = INSTR_TYPE_POP_FP;
+		else if (is_instr_pop(instr))
+			type = INSTR_TYPE_POP;
+		else if (is_instr_branch(instr))
+			type = INSTR_TYPE_BRANCH;
+		else
+			type = INSTR_TYPE_UNKNOWN;
+
+		if (type != INSTR_TYPE_UNKNOWN)
+			instr_p[nr_instr++] = type;
+
+		c_addr += delta;
+	}
+
+	return nr_instr;
+}
+
+static int is_func_prologue_epilogue(unsigned long *addr)
+{
+	unsigned long instr_prev, instr_curr, instr_next;
+
+	instr_before_nr = 0;
+	instr_after_nr = 0;
+
+	if (get_user(instr_curr, addr))
+		return 1;
+
+	if (get_user(instr_prev, addr - 1))
+		return 1;
+
+	if (get_user(instr_next, addr + 1))
+		return 1;
+
+	if (is_instr_pop_fp(instr_curr))
+		return 0;
+
+	if (is_instr_push_with_fp(instr_curr) ||
+		is_instr_push_with_fp(instr_next) ||
+		is_instr_push_with_fp(instr_prev) ||
+		is_instr_add_fp(instr_curr) ||
+		is_instr_add_fp(instr_next) ||
+		is_instr_pop_fp(instr_prev)) {
+		return 1;
+	}
+
+	instr_before_nr = read_instructions(addr, 0);
+	if (instr_before_nr < 0)
+		return 1;
+
+	instr_after_nr = read_instructions(addr, 1);
+	if (instr_after_nr < 0)
+		return 1;
+
+	if (!instr_before_nr && !instr_after_nr)
+		return 0;
+
+	if (instr_before_nr) {
+		if (instr_before[0] == INSTR_TYPE_ADD_FP)
+			return 0;
+		else if (instr_before[0] == INSTR_TYPE_PUSH_FP)
+			return 1;
+	}
+
+	if (instr_after_nr) {
+		if (instr_after[0] == INSTR_TYPE_PUSH_FP)
+			return 1;
+		else if (instr_after[0] == INSTR_TYPE_ADD_FP)
+			return 1;
+	}
+
+	return 0;
+}
+#endif	/* PERF_CALLCHAIN_CHECK_PROLOG_EPILOG */
+
+#endif  /* CONFIG_PERF_ANDROID_BACKTRACE */
+
+#ifndef CONFIG_PERF_ANDROID_BACKTRACE
 void
-perf_callchain_user(struct perf_callchain_entry *entry, struct pt_regs *regs)
+perf_callchain_user(struct perf_callchain_entry_ctx *entry, struct pt_regs *regs)
 {
 	struct frame_tail __user *tail;
 
@@ -672,10 +821,95 @@ perf_callchain_user(struct perf_callchain_entry *entry, struct pt_regs *regs)
 	perf_callchain_store(entry, regs->ARM_pc);
 	tail = (struct frame_tail __user *)regs->ARM_fp - 1;
 
-	while ((entry->nr < PERF_MAX_STACK_DEPTH) &&
+	while ((entry->entry->nr < entry->max_stack) &&
 	       tail && !((unsigned long)tail & 0x3))
 		tail = user_backtrace(tail, entry);
 }
+#else	/* CONFIG_PERF_ANDROID_BACKTRACE */
+static inline int
+perf_check_frame_address(unsigned long addr, struct vm_area_struct *vma)
+{
+	unsigned long start, end;
+
+	if (vma) {
+		start = vma->vm_start;
+		end = vma->vm_end;
+		if (addr >= start && addr <= end - 2 * sizeof(unsigned long))
+			return 0;
+	}
+	return -EINVAL;
+}
+
+void
+perf_callchain_user(struct perf_callchain_entry_ctx *entry, struct pt_regs *regs)
+{
+	struct frame_tail __user *tail;
+	unsigned long *fp, reg;
+	struct vm_area_struct *vma;
+	int pe_flag = 0;
+
+	if (thumb_mode(regs))
+		return;
+
+	fp = (unsigned long *)regs->ARM_fp;
+	if (!access_ok(VERIFY_READ, fp, sizeof(unsigned long)))
+		return;
+
+	vma = find_vma(current->mm, regs->ARM_sp);
+
+	if (fp < (unsigned long *)regs->ARM_sp)
+		return;
+
+	if (perf_check_frame_address((unsigned long)fp, vma))
+		return;
+
+	if (__copy_from_user_inatomic(&reg, fp, sizeof(unsigned long)))
+		return;
+
+#ifdef PERF_CALLCHAIN_CHECK_PROLOG_EPILOG
+	if (is_func_prologue_epilogue((unsigned long *)regs->ARM_pc))
+		pe_flag = 1;
+#endif
+
+	if (pe_flag) {
+		/* fp->prev frame tail (fp, lr) */
+		if (regs->ARM_lr < AB_USER_SPACE_MIN_ADDR)
+			return;
+		perf_callchain_store(entry, (unsigned long)regs->ARM_lr);
+		tail = (struct frame_tail *)(regs->ARM_fp
+			- sizeof(unsigned long));
+	} else {
+		if ((unsigned long *)reg > fp &&
+			!perf_check_frame_address(reg, vma)) {
+			/* fp->short frame tail (fp) */
+
+			if (regs->ARM_lr < AB_USER_SPACE_MIN_ADDR)
+				return;
+			perf_callchain_store(entry, regs->ARM_lr);
+			tail = (struct frame_tail *)(reg
+				- sizeof(unsigned long));
+		} else {
+			/* fp->current frame tail (fp, lr) */
+			tail = (struct frame_tail *)(regs->ARM_fp
+				- sizeof(unsigned long));
+		}
+	}
+
+	if ((unsigned long *)tail->fp <= fp ||
+		perf_check_frame_address(tail->fp, vma)) {
+		return;
+	}
+
+	while ((entry->entry->nr < entry->max_stack) &&
+	       tail && !((unsigned long)tail & 0x3)) {
+		if (perf_check_frame_address((unsigned long)tail, vma) ||
+			tail->lr < AB_USER_SPACE_MIN_ADDR) {
+			return;
+		}
+		tail = user_backtrace(tail, entry);
+	}
+}
+#endif	/* CONFIG_PERF_ANDROID_BACKTRACE */
 
 /*
  * Gets called by walk_stackframe() for every stackframe. This will be called
@@ -686,13 +920,13 @@ static int
 callchain_trace(struct stackframe *fr,
 		void *data)
 {
-	struct perf_callchain_entry *entry = data;
+	struct perf_callchain_entry_ctx *entry = data;
 	perf_callchain_store(entry, fr->pc);
 	return 0;
 }
 
 void
-perf_callchain_kernel(struct perf_callchain_entry *entry, struct pt_regs *regs)
+perf_callchain_kernel(struct perf_callchain_entry_ctx *entry, struct pt_regs *regs)
 {
 	struct stackframe fr;
 

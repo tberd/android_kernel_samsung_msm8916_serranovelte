@@ -46,13 +46,21 @@
 #include <net/ip6_checksum.h>
 #include <net/xfrm.h>
 #include <net/inet6_hashtables.h>
+#include <net/sock_reuseport.h>
 
 #include <linux/proc_fs.h>
 #include <linux/seq_file.h>
 #include <trace/events/skb.h>
 #include "udp_impl.h"
 
-int ipv6_rcv_saddr_equal(const struct sock *sk, const struct sock *sk2)
+/* match_wildcard == true:  IPV6_ADDR_ANY equals to any IPv6 addresses if IPv6
+ *                          only, and any IPv4 addresses if not IPv6 only
+ * match_wildcard == false: addresses must be exactly the same, i.e.
+ *                          IPV6_ADDR_ANY only equals to IPV6_ADDR_ANY,
+ *                          and 0.0.0.0 equals to 0.0.0.0 only
+ */
+int ipv6_rcv_saddr_equal(const struct sock *sk, const struct sock *sk2,
+			 bool match_wildcard)
 {
 	const struct in6_addr *sk_rcv_saddr6 = &inet6_sk(sk)->rcv_saddr;
 	const struct in6_addr *sk2_rcv_saddr6 = inet6_rcv_saddr(sk2);
@@ -64,16 +72,24 @@ int ipv6_rcv_saddr_equal(const struct sock *sk, const struct sock *sk2)
 	int addr_type2 = sk2_rcv_saddr6 ? ipv6_addr_type(sk2_rcv_saddr6) : IPV6_ADDR_MAPPED;
 
 	/* if both are mapped, treat as IPv4 */
-	if (addr_type == IPV6_ADDR_MAPPED && addr_type2 == IPV6_ADDR_MAPPED)
-		return (!sk2_ipv6only &&
-			(!sk1_rcv_saddr || !sk2_rcv_saddr ||
-			  sk1_rcv_saddr == sk2_rcv_saddr));
+	if (addr_type == IPV6_ADDR_MAPPED && addr_type2 == IPV6_ADDR_MAPPED) {
+		if (!sk2_ipv6only) {
+			if (sk1_rcv_saddr == sk2_rcv_saddr)
+				return 1;
+			if (!sk1_rcv_saddr || !sk2_rcv_saddr)
+				return match_wildcard;
+		}
+		return 0;
+	}
 
-	if (addr_type2 == IPV6_ADDR_ANY &&
+	if (addr_type == IPV6_ADDR_ANY && addr_type2 == IPV6_ADDR_ANY)
+		return 1;
+
+	if (addr_type2 == IPV6_ADDR_ANY && match_wildcard &&
 	    !(sk2_ipv6only && addr_type == IPV6_ADDR_MAPPED))
 		return 1;
 
-	if (addr_type == IPV6_ADDR_ANY &&
+	if (addr_type == IPV6_ADDR_ANY && match_wildcard &&
 	    !(sk_ipv6only && addr_type2 == IPV6_ADDR_MAPPED))
 		return 1;
 
@@ -218,8 +234,14 @@ begin:
 			badness = score;
 			reuseport = sk->sk_reuseport;
 			if (reuseport) {
+				struct sock *sk2;
 				hash = inet6_ehashfn(net, daddr, hnum,
 						     saddr, sport);
+				sk2 = reuseport_select_sock(sk, hash, NULL, 0);
+				if (sk2) {
+					result = sk2;
+					goto exact_match;
+				}
 				matches = 1;
 			} else if (score == SCORE2_MAX)
 				goto exact_match;
@@ -254,7 +276,8 @@ exact_match:
 struct sock *__udp6_lib_lookup(struct net *net,
 				      const struct in6_addr *saddr, __be16 sport,
 				      const struct in6_addr *daddr, __be16 dport,
-				      int dif, struct udp_table *udptable)
+				      int dif, struct udp_table *udptable,
+				      struct sk_buff *skb)
 {
 	struct sock *sk, *result;
 	struct hlist_nulls_node *node;
@@ -299,8 +322,15 @@ begin:
 			badness = score;
 			reuseport = sk->sk_reuseport;
 			if (reuseport) {
+				struct sock *sk2;
 				hash = inet6_ehashfn(net, daddr, hnum,
 						     saddr, sport);
+				sk2 = reuseport_select_sock(sk, hash, skb,
+							sizeof(struct udphdr));
+				if (sk2) {
+					result = sk2;
+					goto found;
+				}
 				matches = 1;
 			}
 		} else if (score == badness && reuseport) {
@@ -319,6 +349,7 @@ begin:
 		goto begin;
 
 	if (result) {
+found:
 		if (unlikely(!atomic_inc_not_zero_hint(&result->sk_refcnt, 2)))
 			result = NULL;
 		else if (unlikely(compute_score(result, net, hnum, saddr, sport,
@@ -343,13 +374,13 @@ static struct sock *__udp6_lib_lookup_skb(struct sk_buff *skb,
 		return sk;
 	return __udp6_lib_lookup(dev_net(skb_dst(skb)->dev), &iph->saddr, sport,
 				 &iph->daddr, dport, inet6_iif(skb),
-				 udptable);
+				 udptable, skb);
 }
 
 struct sock *udp6_lib_lookup(struct net *net, const struct in6_addr *saddr, __be16 sport,
 			     const struct in6_addr *daddr, __be16 dport, int dif)
 {
-	return __udp6_lib_lookup(net, saddr, sport, daddr, dport, dif, &udp_table);
+	return __udp6_lib_lookup(net, saddr, sport, daddr, dport, dif, &udp_table, NULL);
 }
 EXPORT_SYMBOL_GPL(udp6_lib_lookup);
 
@@ -359,8 +390,7 @@ EXPORT_SYMBOL_GPL(udp6_lib_lookup);
  * 	return it, otherwise we block.
  */
 
-int udpv6_recvmsg(struct kiocb *iocb, struct sock *sk,
-		  struct msghdr *msg, size_t len,
+int udpv6_recvmsg(struct sock *sk, struct msghdr *msg, size_t len,
 		  int noblock, int flags, int *addr_len)
 {
 	struct ipv6_pinfo *np = inet6_sk(sk);
@@ -462,6 +492,10 @@ try_again:
 						    IP6CB(skb)->iif);
 		}
 		*addr_len = sizeof(*sin6);
+
+		if (cgroup_bpf_enabled)
+			BPF_CGROUP_RUN_PROG_UDP6_RECVMSG_LOCK(sk,
+						(struct sockaddr *)sin6);
 	}
 	if (is_udp4) {
 		if (inet->cmsg_flags)
@@ -516,7 +550,7 @@ void __udp6_lib_err(struct sk_buff *skb, struct inet6_skb_parm *opt,
 	int err;
 
 	sk = __udp6_lib_lookup(dev_net(skb->dev), daddr, uh->dest,
-			       saddr, uh->source, inet6_iif(skb), udptable);
+			       saddr, uh->source, inet6_iif(skb), udptable, skb);
 	if (sk == NULL)
 		return;
 
@@ -900,6 +934,25 @@ static void udp_v6_flush_pending_frames(struct sock *sk)
 	}
 }
 
+static int udpv6_pre_connect(struct sock *sk, struct sockaddr *uaddr,
+			     int addr_len)
+{
+	/* The following checks are replicated from __ip6_datagram_connect()
+	 * and intended to prevent BPF program called below from accessing
+	 * bytes that are out of the bound specified by user in addr_len.
+	 */
+	if (uaddr->sa_family == AF_INET) {
+		if (__ipv6_only_sock(sk))
+			return -EAFNOSUPPORT;
+		return udp_pre_connect(sk, uaddr, addr_len);
+	}
+
+	if (addr_len < SIN6_LEN_RFC2133)
+		return -EINVAL;
+
+	return BPF_CGROUP_RUN_PROG_INET6_CONNECT_LOCK(sk, uaddr);
+}
+
 /**
  * 	udp6_hwcsum_outgoing  -  handle outgoing HW checksumming
  * 	@sk: 	socket we are sending on
@@ -1006,8 +1059,7 @@ out:
 	return err;
 }
 
-int udpv6_sendmsg(struct kiocb *iocb, struct sock *sk,
-		  struct msghdr *msg, size_t len)
+int udpv6_sendmsg(struct sock *sk, struct msghdr *msg, size_t len)
 {
 	struct ipv6_txoptions opt_space;
 	struct udp_sock *up = udp_sk(sk);
@@ -1070,12 +1122,12 @@ int udpv6_sendmsg(struct kiocb *iocb, struct sock *sk,
 do_udp_sendmsg:
 			if (__ipv6_only_sock(sk))
 				return -ENETUNREACH;
-			return udp_sendmsg(iocb, sk, msg, len);
+			return udp_sendmsg(sk, msg, len);
 		}
 	}
 
 	if (up->pending == AF_INET)
-		return udp_sendmsg(iocb, sk, msg, len);
+		return udp_sendmsg(sk, msg, len);
 
 	/* Rough check on arithmetic overflow,
 	   better check is made in ip6_append_data().
@@ -1188,6 +1240,29 @@ do_udp_sendmsg:
 		fl6.saddr = np->saddr;
 	fl6.fl6_sport = inet->inet_sport;
 
+	if (cgroup_bpf_enabled && !connected) {
+		err = BPF_CGROUP_RUN_PROG_UDP6_SENDMSG_LOCK(sk,
+					   (struct sockaddr *)sin6, &fl6.saddr);
+		if (err)
+			goto out_no_dst;
+		if (sin6) {
+			if (ipv6_addr_v4mapped(&sin6->sin6_addr)) {
+				/* BPF program rewrote IPv6-only by IPv4-mapped
+				 * IPv6. It's currently unsupported.
+				 */
+				err = -ENOTSUPP;
+				goto out_no_dst;
+			}
+			if (sin6->sin6_port == 0) {
+				/* BPF program set invalid port. Reject it. */
+				err = -EINVAL;
+				goto out_no_dst;
+			}
+			fl6.fl6_dport = sin6->sin6_port;
+			fl6.daddr = sin6->sin6_addr;
+		}
+	}
+
 	final_p = fl6_update_dst(&fl6, opt, &final);
 	if (final_p)
 		connected = 0;
@@ -1274,6 +1349,7 @@ do_append_data:
 	release_sock(sk);
 out:
 	dst_release(dst);
+out_no_dst:
 	fl6_sock_release(flowlabel);
 	txopt_put(opt_to_free);
 	if (!err)
@@ -1460,6 +1536,7 @@ struct proto udpv6_prot = {
 	.name		   = "UDPv6",
 	.owner		   = THIS_MODULE,
 	.close		   = udp_lib_close,
+	.pre_connect		= udpv6_pre_connect,
 	.connect	   = ip6_datagram_connect,
 	.disconnect	   = udp_disconnect,
 	.ioctl		   = udp_ioctl,

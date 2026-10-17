@@ -48,6 +48,8 @@
  *	YOSHIFUJI Hideaki @USAGI and:	Support IPV6_V6ONLY socket option, which
  *	Alexey Kuznetsov		allow both IPv4 and IPv6 sockets to bind
  *					a single port at the same time.
+ *
+ * Copyright (c) 2013-2016, NVIDIA CORPORATION.  All rights reserved.
  */
 
 #define pr_fmt(fmt) "TCP: " fmt
@@ -136,6 +138,19 @@ int tcp_twsk_unique(struct sock *sk, struct sock *sktw, void *twp)
 	return 0;
 }
 EXPORT_SYMBOL_GPL(tcp_twsk_unique);
+
+static int tcp_v4_pre_connect(struct sock *sk, struct sockaddr *uaddr,
+			      int addr_len)
+{
+	/* This check is replicated from tcp_v4_connect() and intended to
+	 * prevent BPF program called below from accessing bytes that are out
+	 * of the bound specified by user in addr_len.
+	 */
+	if (addr_len < sizeof(struct sockaddr_in))
+		return -EINVAL;
+
+	return BPF_CGROUP_RUN_PROG_INET4_CONNECT(sk, uaddr);
+}
 
 /* This will initiate an outgoing connection. */
 int tcp_v4_connect(struct sock *sk, struct sockaddr *uaddr, int addr_len)
@@ -239,7 +254,7 @@ int tcp_v4_connect(struct sock *sk, struct sockaddr *uaddr, int addr_len)
 							   inet->inet_sport,
 							   usin->sin_port);
 
-	inet->inet_id = tp->write_seq ^ jiffies;
+	inet->inet_id = prandom_u32();
 
 	err = tcp_connect(sk);
 
@@ -437,15 +452,16 @@ void tcp_v4_err(struct sk_buff *icmp_skb, u32 info)
 			break;
 
 		icsk->icsk_backoff--;
-		inet_csk(sk)->icsk_rto = (tp->srtt ? __tcp_set_rto(tp) :
+		inet_csk(sk)->icsk_rto = (tp->srtt_us ? __tcp_set_rto(tp) :
 			TCP_TIMEOUT_INIT) << icsk->icsk_backoff;
 		tcp_bound_rto(sk);
 
 		skb = tcp_write_queue_head(sk);
 		BUG_ON(!skb);
 
-		remaining = icsk->icsk_rto - min(icsk->icsk_rto,
-				tcp_time_stamp - TCP_SKB_CB(skb)->when);
+		remaining = icsk->icsk_rto -
+			    min(icsk->icsk_rto,
+				tcp_time_stamp - tcp_skb_timestamp(skb));
 
 		if (remaining) {
 			inet_csk_reset_xmit_timer(sk, ICSK_TIME_RETRANS,
@@ -734,7 +750,7 @@ release_sk1:
    outside socket context is ugly, certainly. What can I do?
  */
 
-static void tcp_v4_send_ack(const struct sock *sk, struct sk_buff *skb,
+static void tcp_v4_send_ack(struct net *net, const struct sock *sk, struct sk_buff *skb,
 			    u32 seq, u32 ack,
 			    u32 win, u32 tsval, u32 tsecr, int oif,
 			    struct tcp_md5sig_key *key,
@@ -750,7 +766,6 @@ static void tcp_v4_send_ack(const struct sock *sk, struct sk_buff *skb,
 			];
 	} rep;
 	struct ip_reply_arg arg;
-	struct net *net = sock_net(sk);
 
 	memset(&rep.th, 0, sizeof(struct tcphdr));
 	memset(&arg, 0, sizeof(arg));
@@ -812,7 +827,7 @@ static void tcp_v4_timewait_ack(struct sock *sk, struct sk_buff *skb)
 	struct inet_timewait_sock *tw = inet_twsk(sk);
 	struct tcp_timewait_sock *tcptw = tcp_twsk(sk);
 
-	tcp_v4_send_ack(sk, skb, tcptw->tw_snd_nxt, tcptw->tw_rcv_nxt,
+	tcp_v4_send_ack(sock_net(sk), sk, skb, tcptw->tw_snd_nxt, tcptw->tw_rcv_nxt,
 			tcptw->tw_rcv_wnd >> tw->tw_rcv_wscale,
 			tcp_time_stamp + tcptw->tw_ts_offset,
 			tcptw->tw_ts_recent,
@@ -831,7 +846,7 @@ static void tcp_v4_reqsk_send_ack(struct sock *sk, struct sk_buff *skb,
 	/* sk->sk_state == TCP_LISTEN -> for regular TCP_SYN_RECV
 	 * sk->sk_state == TCP_SYN_RECV -> for Fast Open.
 	 */
-	tcp_v4_send_ack(sk, skb, (sk->sk_state == TCP_LISTEN) ?
+	tcp_v4_send_ack(sock_net(sk), sk, skb, (sk->sk_state == TCP_LISTEN) ?
 			tcp_rsk(req)->snt_isn + 1 : tcp_sk(sk)->snd_nxt,
 			tcp_rsk(req)->rcv_nxt,
 			req->rcv_wnd >> inet_rsk(req)->rcv_wscale,
@@ -873,8 +888,8 @@ static int tcp_v4_send_synack(struct sock *sk, struct dst_entry *dst,
 					    ireq->rmt_addr,
 					    ireq->opt);
 		err = net_xmit_eval(err);
-		if (!tcp_rsk(req)->snt_synack && !err)
-			tcp_rsk(req)->snt_synack = tcp_time_stamp;
+		if (!tcp_rsk(req)->snt_synack.v64 && !err)
+			skb_mstamp_get(&tcp_rsk(req)->snt_synack);
 	}
 
 	return err;
@@ -1040,7 +1055,7 @@ int tcp_md5_do_add(struct sock *sk, const union tcp_md5_addr *addr,
 	key = sock_kmalloc(sk, sizeof(*key), gfp);
 	if (!key)
 		return -ENOMEM;
-	if (hlist_empty(&md5sig->head) && !tcp_alloc_md5sig_pool(sk)) {
+	if (!tcp_alloc_md5sig_pool()) {
 		sock_kfree_s(sk, key, sizeof(*key));
 		return -ENOMEM;
 	}
@@ -1058,9 +1073,7 @@ EXPORT_SYMBOL(tcp_md5_do_add);
 
 int tcp_md5_do_del(struct sock *sk, const union tcp_md5_addr *addr, int family)
 {
-	struct tcp_sock *tp = tcp_sk(sk);
 	struct tcp_md5sig_key *key;
-	struct tcp_md5sig_info *md5sig;
 
 	key = tcp_md5_do_lookup(sk, addr, family);
 	if (!key)
@@ -1068,10 +1081,6 @@ int tcp_md5_do_del(struct sock *sk, const union tcp_md5_addr *addr, int family)
 	hlist_del_rcu(&key->node);
 	atomic_sub(sizeof(*key), &sk->sk_omem_alloc);
 	kfree_rcu(key, rcu);
-	md5sig = rcu_dereference_protected(tp->md5sig_info,
-					   sock_owned_by_user(sk));
-	if (hlist_empty(&md5sig->head))
-		tcp_free_md5sig_pool();
 	return 0;
 }
 EXPORT_SYMBOL(tcp_md5_do_del);
@@ -1085,8 +1094,6 @@ static void tcp_clear_md5_list(struct sock *sk)
 
 	md5sig = rcu_dereference_protected(tp->md5sig_info, 1);
 
-	if (!hlist_empty(&md5sig->head))
-		tcp_free_md5sig_pool();
 	hlist_for_each_entry_safe(key, n, &md5sig->head, node) {
 		hlist_del_rcu(&key->node);
 		atomic_sub(sizeof(*key), &sk->sk_omem_alloc);
@@ -1406,7 +1413,7 @@ static int tcp_v4_conn_req_fastopen(struct sock *sk,
 				    ireq->rmt_addr, ireq->opt);
 	err = net_xmit_eval(err);
 	if (!err)
-		tcp_rsk(req)->snt_synack = tcp_time_stamp;
+		skb_mstamp_get(&tcp_rsk(req)->snt_synack);
 	/* XXX (TFO) - is it ok to ignore error and continue? */
 
 	spin_lock(&queue->fastopenq->lock);
@@ -1447,8 +1454,8 @@ static int tcp_v4_conn_req_fastopen(struct sock *sk,
 	inet_csk(child)->icsk_af_ops->rebuild_header(child);
 	tcp_init_congestion_control(child);
 	tcp_mtup_init(child);
-	tcp_init_buffer_space(child);
 	tcp_init_metrics(child);
+	tcp_init_buffer_space(child);
 
 	/* Queue the data carried in the SYN packet. We need to first
 	 * bump skb's refcnt because the caller will attempt to free it.
@@ -1487,7 +1494,7 @@ int tcp_v4_conn_request(struct sock *sk, struct sk_buff *skb)
 	struct dst_entry *dst = NULL;
 	__be32 saddr = ip_hdr(skb)->saddr;
 	__be32 daddr = ip_hdr(skb)->daddr;
-	__u32 isn = TCP_SKB_CB(skb)->when;
+	__u32 isn = TCP_SKB_CB(skb)->tcp_tw_isn;
 	bool want_cookie = false;
 	struct flowi4 fl4;
 	struct tcp_fastopen_cookie foc = { .len = -1 };
@@ -1537,6 +1544,8 @@ int tcp_v4_conn_request(struct sock *sk, struct sk_buff *skb)
 
 	tmp_opt.tstamp_ok = tmp_opt.saw_tstamp;
 	tcp_openreq_init(req, &tmp_opt, skb);
+	write_pnet(&inet_rsk(req)->ireq_net, sock_net(sk));
+	atomic64_set(&inet_rsk(req)->ir_cookie, 0);
 
 	ireq = inet_rsk(req);
 	ireq->loc_addr = daddr;
@@ -1629,7 +1638,7 @@ int tcp_v4_conn_request(struct sock *sk, struct sk_buff *skb)
 		if (err || want_cookie)
 			goto drop_and_free;
 
-		tcp_rsk(req)->snt_synack = tcp_time_stamp;
+		skb_mstamp_get(&tcp_rsk(req)->snt_synack);
 		tcp_rsk(req)->listener = NULL;
 		/* Add the request_sock to the SYN table */
 		inet_csk_reqsk_queue_hash_add(sk, req, TCP_TIMEOUT_INIT);
@@ -1694,7 +1703,7 @@ struct sock *tcp_v4_syn_recv_sock(struct sock *sk, struct sk_buff *skb,
 	inet_csk(newsk)->icsk_ext_hdr_len = 0;
 	if (inet_opt)
 		inet_csk(newsk)->icsk_ext_hdr_len = inet_opt->opt.optlen;
-	newinet->inet_id = newtp->write_seq ^ jiffies;
+	newinet->inet_id = prandom_u32();
 
 	if (!dst) {
 		dst = inet_csk_route_child_sock(sk, newsk, req);
@@ -1713,8 +1722,6 @@ struct sock *tcp_v4_syn_recv_sock(struct sock *sk, struct sk_buff *skb,
 		newtp->advmss = tcp_sk(sk)->rx_opt.user_mss;
 
 	tcp_initialize_rcv_mss(newsk);
-	tcp_synack_rtt_meas(newsk, req);
-	newtp->total_retrans = req->num_retrans;
 
 #ifdef CONFIG_TCP_MD5SIG
 	/* Copy over the MD5 key from the original socket */
@@ -1839,14 +1846,11 @@ int tcp_v4_do_rcv(struct sock *sk, struct sk_buff *skb)
 				sk->sk_rx_dst = NULL;
 			}
 		}
-		if (tcp_rcv_established(sk, skb, tcp_hdr(skb), skb->len)) {
-			rsk = sk;
-			goto reset;
-		}
+		tcp_rcv_established(sk, skb, tcp_hdr(skb), skb->len);
 		return 0;
 	}
 
-	if (skb->len < tcp_hdrlen(skb) || tcp_checksum_complete(skb))
+	if (tcp_checksum_complete(skb))
 		goto csum_err;
 
 	if (sk->sk_state == TCP_LISTEN) {
@@ -1953,7 +1957,7 @@ bool tcp_prequeue(struct sock *sk, struct sk_buff *skb)
 	if (likely(sk->sk_rx_dst))
 		skb_dst_drop(skb);
 	else
-		skb_dst_force(skb);
+		skb_dst_force_safe(skb);
 
 	__skb_queue_tail(&tp->ucopy.prequeue, skb);
 	tp->ucopy.memory += skb->truesize;
@@ -2037,7 +2041,7 @@ int tcp_v4_rcv(struct sk_buff *skb)
 	TCP_SKB_CB(skb)->end_seq = (TCP_SKB_CB(skb)->seq + th->syn + th->fin +
 				    skb->len - th->doff * 4);
 	TCP_SKB_CB(skb)->ack_seq = ntohl(th->ack_seq);
-	TCP_SKB_CB(skb)->when	 = 0;
+	TCP_SKB_CB(skb)->tcp_tw_isn = 0;
 	TCP_SKB_CB(skb)->ip_dsfield = ipv4_get_dsfield(iph);
 	TCP_SKB_CB(skb)->sacked	 = 0;
 
@@ -2103,7 +2107,7 @@ no_tcp_socket:
 	if (!xfrm4_policy_check(NULL, XFRM_POLICY_IN, skb))
 		goto discard_it;
 
-	if (skb->len < (th->doff << 2) || tcp_checksum_complete(skb)) {
+	if (tcp_checksum_complete(skb)) {
 csum_error:
 		TCP_INC_STATS_BH(net, TCP_MIB_CSUMERRORS);
 bad_packet:
@@ -2170,8 +2174,7 @@ void inet_sk_rx_dst_set(struct sock *sk, const struct sk_buff *skb)
 {
 	struct dst_entry *dst = skb_dst(skb);
 
-	if (dst) {
-		dst_hold(dst);
+	if (dst && dst_hold_safe(dst)) {
 		sk->sk_rx_dst = dst;
 		inet_sk(sk)->rx_dst_ifindex = skb->skb_iif;
 	}
@@ -2713,7 +2716,6 @@ static void get_tcp4_sock(struct sock *sk, struct seq_file *f, int i)
 	__be32 src = inet->inet_rcv_saddr;
 	__u16 destp = ntohs(inet->inet_dport);
 	__u16 srcp = ntohs(inet->inet_sport);
-	__u8 state = sk->sk_state;
 	int rx_queue;
 
 	if (icsk->icsk_pending == ICSK_TIME_RETRANS ||
@@ -2732,9 +2734,6 @@ static void get_tcp4_sock(struct sock *sk, struct seq_file *f, int i)
 		timer_expires = jiffies;
 	}
 
-	if (inet->transparent)
-		state |= 0x80;
-
 	if (sk->sk_state == TCP_LISTEN)
 		rx_queue = sk->sk_ack_backlog;
 	else
@@ -2745,7 +2744,7 @@ static void get_tcp4_sock(struct sock *sk, struct seq_file *f, int i)
 
 	seq_printf(f, "%4d: %08X:%04X %08X:%04X %02X %08X:%08X %02X:%08lX "
 			"%08X %5d %8d %lu %d %pK %lu %lu %u %u %d",
-		i, src, srcp, dest, destp, state,
+		i, src, srcp, dest, destp, sk->sk_state,
 		tp->write_seq - tp->snd_una,
 		rx_queue,
 		timer_active,
@@ -2908,6 +2907,7 @@ struct proto tcp_prot = {
 	.name			= "TCP",
 	.owner			= THIS_MODULE,
 	.close			= tcp_close,
+	.pre_connect		= tcp_v4_pre_connect,
 	.connect		= tcp_v4_connect,
 	.disconnect		= tcp_disconnect,
 	.accept			= inet_csk_accept,

@@ -29,18 +29,18 @@
 #define ULLONG_MAX	(~0ULL)
 #define SIZE_MAX	(~(size_t)0)
 
-#define U8_MAX         ((u8)~0U)
-#define S8_MAX         ((s8)(U8_MAX>>1))
-#define S8_MIN         ((s8)(-S8_MAX - 1))
-#define U16_MAX        ((u16)~0U)
-#define S16_MAX        ((s16)(U16_MAX>>1))
-#define S16_MIN        ((s16)(-S16_MAX - 1))
-#define U32_MAX        ((u32)~0U)
-#define S32_MAX        ((s32)(U32_MAX>>1))
-#define S32_MIN        ((s32)(-S32_MAX - 1))
-#define U64_MAX        ((u64)~0ULL)
-#define S64_MAX        ((s64)(U64_MAX>>1))
-#define S64_MIN        ((s64)(-S64_MAX - 1))
+#define U8_MAX		((u8)~0U)
+#define S8_MAX		((s8)(U8_MAX>>1))
+#define S8_MIN		((s8)(-S8_MAX - 1))
+#define U16_MAX		((u16)~0U)
+#define S16_MAX		((s16)(U16_MAX>>1))
+#define S16_MIN		((s16)(-S16_MAX - 1))
+#define U32_MAX		((u32)~0U)
+#define S32_MAX		((s32)(U32_MAX>>1))
+#define S32_MIN		((s32)(-S32_MAX - 1))
+#define U64_MAX		((u64)~0ULL)
+#define S64_MAX		((s64)(U64_MAX>>1))
+#define S64_MIN		((s64)(-S64_MAX - 1))
 
 #define STACK_MAGIC	0xdeadbeef
 
@@ -52,6 +52,13 @@
 #define IS_ALIGNED(x, a)		(((x) & ((typeof(x))(a) - 1)) == 0)
 
 #define ARRAY_SIZE(arr) (sizeof(arr) / sizeof((arr)[0]) + __must_be_array(arr))
+
+#define u64_to_user_ptr(x) (		\
+{					\
+	typecheck(u64, x);		\
+	(void __user *)(uintptr_t)x;	\
+}					\
+)
 
 /*
  * This looks more complex than it should be. But we need to
@@ -101,6 +108,19 @@
 	 ((typeof(divisor))-1) > 0 || (__x) > 0) ?	\
 		(((__x) + ((__d) / 2)) / (__d)) :	\
 		(((__x) - ((__d) / 2)) / (__d));	\
+}							\
+)
+
+/*
+ * Same as above but for u64 dividends. divisor must be a 32-bit
+ * number.
+ */
+#define DIV_ROUND_CLOSEST_ULL(x, divisor)(		\
+{							\
+	typeof(divisor) __d = divisor;			\
+	unsigned long long _tmp = (x) + (__d) / 2;	\
+	do_div(_tmp, __d);				\
+	_tmp;						\
 }							\
 )
 
@@ -206,10 +226,32 @@ extern int _cond_resched(void);
 		(__x < 0) ? -__x : __x;		\
 	})
 
-#if defined(CONFIG_PROVE_LOCKING) || defined(CONFIG_DEBUG_ATOMIC_SLEEP)
+/**
+ * reciprocal_scale - "scale" a value into range [0, ep_ro)
+ * @val: value
+ * @ep_ro: right open interval endpoint
+ *
+ * Perform a "reciprocal multiplication" in order to "scale" a value into
+ * range [0, ep_ro), where the upper interval endpoint is right-open.
+ * This is useful, e.g. for accessing a index of an array containing
+ * ep_ro elements, for example. Think of it as sort of modulus, only that
+ * the result isn't that of modulo. ;) Note that if initial input is a
+ * small value, then result will return 0.
+ *
+ * Return: a result based on val in interval [0, ep_ro).
+ */
+static inline u32 reciprocal_scale(u32 val, u32 ep_ro)
+{
+	return (u32)(((u64) val * ep_ro) >> 32);
+}
+
+#ifdef CONFIG_PROVE_LOCKING
 void might_fault(void);
 #else
-static inline void might_fault(void) { }
+static inline void might_fault(void)
+{
+	might_sleep();
+}
 #endif
 
 extern struct atomic_notifier_head panic_notifier_list;
@@ -561,7 +603,7 @@ do {									\
 	__trace_printk_check_format(fmt, ##args);			\
 									\
 	if (__builtin_constant_p(fmt))					\
-		__trace_printk(_THIS_IP_, trace_printk_fmt, ##args);	\
+		__trace_bprintk(_THIS_IP_, trace_printk_fmt, ##args);	\
 	else								\
 		__trace_printk(_THIS_IP_, fmt, ##args);			\
 } while (0)

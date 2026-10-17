@@ -1864,6 +1864,10 @@ void __weak module_arch_cleanup(struct module *mod)
 {
 }
 
+void __weak module_arch_freeing_init(struct module *mod)
+{
+}
+
 /* Free a module, remove from lists, etc. */
 static void free_module(struct module *mod)
 {
@@ -1896,6 +1900,7 @@ static void free_module(struct module *mod)
 
 	/* This may be NULL, but that's OK */
 	unset_module_init_ro_nx(mod);
+	module_arch_freeing_init(mod);
 	module_memfree(mod->module_init);
 	kfree(mod->args);
 	percpu_modfree(mod);
@@ -2352,7 +2357,7 @@ static void layout_symtab(struct module *mod, struct load_info *info)
 
 	/* We'll tack temporary mod_kallsyms on the end. */
 	mod->init_size = ALIGN(mod->init_size,
-				      __alignof__(struct mod_kallsyms));
+			       __alignof__(struct mod_kallsyms));
 	info->mod_kallsyms_init_off = mod->init_size;
 	mod->init_size += sizeof(struct mod_kallsyms);
 	mod->init_size = debug_align(mod->init_size);
@@ -2447,13 +2452,7 @@ static void *module_alloc_update_bounds(unsigned long size)
 	return ret;
 }
 
-#if defined(CONFIG_DEBUG_KMEMLEAK) && defined(CONFIG_DEBUG_MODULE_SCAN_OFF)
-static void kmemleak_load_module(const struct module *mod,
-				 const struct load_info *info)
-{
-	kmemleak_no_scan(mod->module_core);
-}
-#elif defined(CONFIG_DEBUG_KMEMLEAK)
+#ifdef CONFIG_DEBUG_KMEMLEAK
 static void kmemleak_load_module(const struct module *mod,
 				 const struct load_info *info)
 {
@@ -2788,7 +2787,7 @@ static void find_module_sections(struct module *mod, struct load_info *info)
 	mod->unused_gpl_crcs = section_addr(info, "__kcrctab_unused_gpl");
 #endif
 #ifdef CONFIG_CONSTRUCTORS
-	mod->ctors = section_objs(info, ".ctors",
+	mod->ctors = section_objs(info, CONFIG_GCOV_CTORS,
 				  sizeof(*mod->ctors), &mod->num_ctors);
 #endif
 
@@ -3014,6 +3013,7 @@ static int alloc_module_percpu(struct module *mod, struct load_info *info)
 static void module_deallocate(struct module *mod, struct load_info *info)
 {
 	percpu_modfree(mod);
+	module_arch_freeing_init(mod);
 	module_memfree(mod->module_init);
 	module_memfree(mod->module_core);
 }
@@ -3067,31 +3067,10 @@ static void do_mod_ctors(struct module *mod)
 #endif
 }
 
-/* For freeing module_init on success, in case kallsyms traversing */
-struct mod_initfree {
-	struct rcu_head rcu;
-	void *module_init;
-};
-
-static void do_free_init(struct rcu_head *head)
-{
-	struct mod_initfree *m = container_of(head, struct mod_initfree, rcu);
-	module_memfree(m->module_init);
-	kfree(m);
-}
-
 /* This is where the real work happens */
 static int do_init_module(struct module *mod)
 {
 	int ret = 0;
-	struct mod_initfree *freeinit;
-
-	freeinit = kmalloc(sizeof(*freeinit), GFP_KERNEL);
-	if (!freeinit) {
-		ret = -ENOMEM;
-		goto fail;
-	}
-	freeinit->module_init = mod->module_init;
 
 	/*
 	 * We want to find out whether @mod uses async during init.  Clear
@@ -3119,7 +3098,16 @@ static int do_init_module(struct module *mod)
 	if (mod->init != NULL)
 		ret = do_one_initcall(mod->init);
 	if (ret < 0) {
-		goto fail_free_freeinit;
+		/* Init routine failed: abort.  Try to protect us from
+                   buggy refcounters. */
+		mod->state = MODULE_STATE_GOING;
+		synchronize_sched();
+		module_put(mod);
+		blocking_notifier_call_chain(&module_notify_list,
+					     MODULE_STATE_GOING, mod);
+		free_module(mod);
+		wake_up_all(&module_wq);
+		return ret;
 	}
 	if (ret > 0) {
 		printk(KERN_WARNING
@@ -3164,33 +3152,16 @@ static int do_init_module(struct module *mod)
 	rcu_assign_pointer(mod->kallsyms, &mod->core_kallsyms);
 #endif
 	unset_module_init_ro_nx(mod);
+	module_arch_freeing_init(mod);
+	module_memfree(mod->module_init);
 	mod->module_init = NULL;
 	mod->init_size = 0;
 	mod->init_ro_size = 0;
 	mod->init_text_size = 0;
-	/*
-	 * We want to free module_init, but be aware that kallsyms may be
-	 * walking this with preempt disabled.  In all the failure paths,
-	 * we call synchronize_rcu/synchronize_sched, but we don't want
-	 * to slow down the success path, so use actual RCU here.
-	 */
-	call_rcu(&freeinit->rcu, do_free_init);
 	mutex_unlock(&module_mutex);
 	wake_up_all(&module_wq);
 
 	return 0;
-fail_free_freeinit:
-	kfree(freeinit);
-fail:
-	/* Try to protect us from buggy refcounters. */
-	mod->state = MODULE_STATE_GOING;
-	synchronize_sched();
-	module_put(mod);
-	blocking_notifier_call_chain(&module_notify_list,
-		MODULE_STATE_GOING, mod);
-	free_module(mod);
-	wake_up_all(&module_wq);
-	return ret;
 }
 
 static int may_init_module(void)
@@ -3523,8 +3494,7 @@ const char *module_address_lookup(unsigned long addr,
 	list_for_each_entry_rcu(mod, &modules, list) {
 		if (mod->state == MODULE_STATE_UNFORMED)
 			continue;
-		if (within_module_init(addr, mod) ||
-		    within_module_core(addr, mod)) {
+		if (within_module(addr, mod)) {
 			if (modname)
 				*modname = mod->name;
 			ret = get_ksymbol(mod, addr, size, offset);
@@ -3548,8 +3518,7 @@ int lookup_module_symbol_name(unsigned long addr, char *symname)
 	list_for_each_entry_rcu(mod, &modules, list) {
 		if (mod->state == MODULE_STATE_UNFORMED)
 			continue;
-		if (within_module_init(addr, mod) ||
-		    within_module_core(addr, mod)) {
+		if (within_module(addr, mod)) {
 			const char *sym;
 
 			sym = get_ksymbol(mod, addr, NULL, NULL);
@@ -3574,8 +3543,7 @@ int lookup_module_symbol_attrs(unsigned long addr, unsigned long *size,
 	list_for_each_entry_rcu(mod, &modules, list) {
 		if (mod->state == MODULE_STATE_UNFORMED)
 			continue;
-		if (within_module_init(addr, mod) ||
-		    within_module_core(addr, mod)) {
+		if (within_module(addr, mod)) {
 			const char *sym;
 
 			sym = get_ksymbol(mod, addr, size, offset);
@@ -3847,8 +3815,7 @@ struct module *__module_address(unsigned long addr)
 	list_for_each_entry_rcu(mod, &modules, list) {
 		if (mod->state == MODULE_STATE_UNFORMED)
 			continue;
-		if (within_module_core(addr, mod)
-		    || within_module_init(addr, mod))
+		if (within_module(addr, mod))
 			return mod;
 	}
 	return NULL;

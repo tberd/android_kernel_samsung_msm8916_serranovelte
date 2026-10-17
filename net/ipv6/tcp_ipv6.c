@@ -21,6 +21,8 @@
  *      modify it under the terms of the GNU General Public License
  *      as published by the Free Software Foundation; either version
  *      2 of the License, or (at your option) any later version.
+ *
+ * Copyright (c) 2013-2016, NVIDIA CORPORATION.  All rights reserved.
  */
 
 #include <linux/bottom_half.h>
@@ -95,10 +97,9 @@ static void inet6_sk_rx_dst_set(struct sock *sk, const struct sk_buff *skb)
 {
 	struct dst_entry *dst = skb_dst(skb);
 
-	if (dst) {
+	if (dst && dst_hold_safe(dst)) {
 		const struct rt6_info *rt = (const struct rt6_info *)dst;
 
-		dst_hold(dst);
 		sk->sk_rx_dst = dst;
 		inet_sk(sk)->rx_dst_ifindex = skb->skb_iif;
 		if (rt->rt6i_node)
@@ -125,6 +126,19 @@ static __u32 tcp_v6_init_sequence(const struct sk_buff *skb)
 					    ipv6_hdr(skb)->saddr.s6_addr32,
 					    tcp_hdr(skb)->dest,
 					    tcp_hdr(skb)->source);
+}
+
+static int tcp_v6_pre_connect(struct sock *sk, struct sockaddr *uaddr,
+			      int addr_len)
+{
+	/* This check is replicated from tcp_v6_connect() and intended to
+	 * prevent BPF program called below from accessing bytes that are out
+	 * of the bound specified by user in addr_len.
+	 */
+	if (addr_len < SIN6_LEN_RFC2133)
+		return -EINVAL;
+
+	return BPF_CGROUP_RUN_PROG_INET6_CONNECT(sk, uaddr);
 }
 
 static int tcp_v6_connect(struct sock *sk, struct sockaddr *uaddr,
@@ -488,10 +502,8 @@ static int tcp_v6_send_synack(struct sock *sk, struct dst_entry *dst,
 
 		fl6->daddr = treq->rmt_addr;
 		skb_set_queue_mapping(skb, queue_mapping);
-		rcu_read_lock();
 		err = ip6_xmit(sk, skb, fl6, rcu_dereference(np->opt),
 			       np->tclass);
-		rcu_read_unlock();
 		err = net_xmit_eval(err);
 	}
 
@@ -974,7 +986,7 @@ static int tcp_v6_conn_request(struct sock *sk, struct sk_buff *skb)
 	struct inet6_request_sock *treq;
 	struct ipv6_pinfo *np = inet6_sk(sk);
 	struct tcp_sock *tp = tcp_sk(sk);
-	__u32 isn = TCP_SKB_CB(skb)->when;
+	__u32 isn = TCP_SKB_CB(skb)->tcp_tw_isn;
 	struct dst_entry *dst = NULL;
 	struct flowi6 fl6;
 	bool want_cookie = false;
@@ -1014,6 +1026,8 @@ static int tcp_v6_conn_request(struct sock *sk, struct sk_buff *skb)
 
 	tmp_opt.tstamp_ok = tmp_opt.saw_tstamp;
 	tcp_openreq_init(req, &tmp_opt, skb);
+	write_pnet(&inet_rsk(req)->ireq_net, sock_net(sk));
+	atomic64_set(&inet_rsk(req)->ir_cookie, 0);
 
 	treq = inet6_rsk(req);
 	treq->rmt_addr = ipv6_hdr(skb)->saddr;
@@ -1090,7 +1104,7 @@ have_isn:
 	    want_cookie)
 		goto drop_and_free;
 
-	tcp_rsk(req)->snt_synack = tcp_time_stamp;
+	skb_mstamp_get(&tcp_rsk(req)->snt_synack);
 	tcp_rsk(req)->listener = NULL;
 	inet6_csk_reqsk_queue_hash_add(sk, req, TCP_TIMEOUT_INIT);
 	return 0;
@@ -1265,8 +1279,6 @@ static struct sock * tcp_v6_syn_recv_sock(struct sock *sk, struct sk_buff *skb,
 		newtp->advmss = tcp_sk(sk)->rx_opt.user_mss;
 
 	tcp_initialize_rcv_mss(newsk);
-	tcp_synack_rtt_meas(newsk, req);
-	newtp->total_retrans = req->num_retrans;
 
 	newinet->inet_daddr = newinet->inet_saddr = LOOPBACK4_IPV6;
 	newinet->inet_rcv_saddr = LOOPBACK4_IPV6;
@@ -1352,10 +1364,6 @@ static int tcp_v6_do_rcv(struct sock *sk, struct sk_buff *skb)
 	if (tcp_v6_inbound_md5_hash (sk, skb))
 		goto discard;
 #endif
-
-	if (tcp_filter(sk, skb))
-		goto discard;
-
 	/*
 	 *	socket locking is here for SMP purposes as backlog rcv
 	 *	is currently called with bh processing disabled.
@@ -1389,14 +1397,13 @@ static int tcp_v6_do_rcv(struct sock *sk, struct sk_buff *skb)
 			}
 		}
 
-		if (tcp_rcv_established(sk, skb, tcp_hdr(skb), skb->len))
-			goto reset;
+		tcp_rcv_established(sk, skb, tcp_hdr(skb), skb->len);
 		if (opt_skb)
 			goto ipv6_pktoptions;
 		return 0;
 	}
 
-	if (skb->len < tcp_hdrlen(skb) || tcp_checksum_complete(skb))
+	if (tcp_checksum_complete(skb))
 		goto csum_err;
 
 	if (sk->sk_state == TCP_LISTEN) {
@@ -1504,7 +1511,7 @@ static int tcp_v6_rcv(struct sk_buff *skb)
 	TCP_SKB_CB(skb)->end_seq = (TCP_SKB_CB(skb)->seq + th->syn + th->fin +
 				    skb->len - th->doff*4);
 	TCP_SKB_CB(skb)->ack_seq = ntohl(th->ack_seq);
-	TCP_SKB_CB(skb)->when = 0;
+	TCP_SKB_CB(skb)->tcp_tw_isn = 0;
 	TCP_SKB_CB(skb)->ip_dsfield = ipv6_get_dsfield(hdr);
 	TCP_SKB_CB(skb)->sacked = 0;
 
@@ -1568,7 +1575,7 @@ no_tcp_socket:
 	if (!xfrm6_policy_check(NULL, XFRM_POLICY_IN, skb))
 		goto discard_it;
 
-	if (skb->len < (th->doff<<2) || tcp_checksum_complete(skb)) {
+	if (tcp_checksum_complete(skb)) {
 csum_error:
 		TCP_INC_STATS_BH(net, TCP_MIB_CSUMERRORS);
 bad_packet:
@@ -1799,7 +1806,6 @@ static void get_tcp6_sock(struct seq_file *seq, struct sock *sp, int i)
 	const struct tcp_sock *tp = tcp_sk(sp);
 	const struct inet_connection_sock *icsk = inet_csk(sp);
 	const struct ipv6_pinfo *np = inet6_sk(sp);
-	__u8 state = sp->sk_state;
 
 	dest  = &np->daddr;
 	src   = &np->rcv_saddr;
@@ -1822,9 +1828,6 @@ static void get_tcp6_sock(struct seq_file *seq, struct sock *sp, int i)
 		timer_expires = jiffies;
 	}
 
-	if (inet->transparent)
-		state |= 0x80;
-
 	seq_printf(seq,
 		   "%4d: %08X%08X%08X%08X:%04X %08X%08X%08X%08X:%04X "
 		   "%02X %08X:%08X %02X:%08lX %08X %5d %8d %lu %d %pK %lu %lu %u %u %d\n",
@@ -1833,7 +1836,7 @@ static void get_tcp6_sock(struct seq_file *seq, struct sock *sp, int i)
 		   src->s6_addr32[2], src->s6_addr32[3], srcp,
 		   dest->s6_addr32[0], dest->s6_addr32[1],
 		   dest->s6_addr32[2], dest->s6_addr32[3], destp,
-		   state,
+		   sp->sk_state,
 		   tp->write_seq-tp->snd_una,
 		   (sp->sk_state == TCP_LISTEN) ? sp->sk_ack_backlog : (tp->rcv_nxt - tp->copied_seq),
 		   timer_active,
@@ -1951,6 +1954,7 @@ struct proto tcpv6_prot = {
 	.name			= "TCPv6",
 	.owner			= THIS_MODULE,
 	.close			= tcp_close,
+	.pre_connect		= tcp_v6_pre_connect,
 	.connect		= tcp_v6_connect,
 	.disconnect		= tcp_disconnect,
 	.accept			= inet_csk_accept,

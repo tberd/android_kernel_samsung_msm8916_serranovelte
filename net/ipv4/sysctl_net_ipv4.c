@@ -35,6 +35,8 @@ static int ip_local_port_range_min[] = { 1, 1 };
 static int ip_local_port_range_max[] = { 65535, 65535 };
 static int tcp_adv_win_scale_min = -31;
 static int tcp_adv_win_scale_max = 31;
+static int tcp_min_snd_mss_min = TCP_MIN_SND_MSS;
+static int tcp_min_snd_mss_max = 65535;
 static int ip_ttl_min = 1;
 static int ip_ttl_max = 255;
 static int tcp_syn_retries_min = 1;
@@ -556,6 +558,13 @@ static struct ctl_table ipv4_table[] = {
 		.proc_handler	= proc_dointvec
 	},
 	{
+		.procname	= "tcp_recovery",
+		.data		= &sysctl_tcp_recovery,
+		.maxlen		= sizeof(int),
+		.mode		= 0644,
+		.proc_handler	= proc_dointvec,
+	},
+	{
 		.procname	= "tcp_reordering",
 		.data		= &sysctl_tcp_reordering,
 		.maxlen		= sizeof(int),
@@ -616,6 +625,13 @@ static struct ctl_table ipv4_table[] = {
 		.proc_handler	= proc_dointvec
 	},
 	{
+		.procname	= "tcp_min_rtt_wlen",
+		.data		= &sysctl_tcp_min_rtt_wlen,
+		.maxlen		= sizeof(int),
+		.mode		= 0644,
+		.proc_handler	= proc_dointvec
+	},
+	{
 		.procname	= "tcp_low_latency",
 		.data		= &sysctl_tcp_low_latency,
 		.maxlen		= sizeof(int),
@@ -662,6 +678,15 @@ static struct ctl_table ipv4_table[] = {
 		.maxlen		= sizeof(int),
 		.mode		= 0644,
 		.proc_handler	= proc_dointvec,
+	},
+	{
+		.procname	= "tcp_min_snd_mss",
+		.data		= &sysctl_tcp_min_snd_mss,
+		.maxlen		= sizeof(int),
+		.mode		= 0644,
+		.proc_handler	= proc_dointvec_minmax,
+		.extra1		= &tcp_min_snd_mss_min,
+		.extra2		= &tcp_min_snd_mss_max,
 	},
 	{
 		.procname	= "tcp_workaround_signed_windows",
@@ -741,13 +766,6 @@ static struct ctl_table ipv4_table[] = {
 		.maxlen		= TCP_CA_BUF_MAX,
 		.mode		= 0644,
 		.proc_handler   = proc_allowed_congestion_control,
-	},
-	{
-		.procname	= "tcp_max_ssthresh",
-		.data		= &sysctl_tcp_max_ssthresh,
-		.maxlen		= sizeof(int),
-		.mode		= 0644,
-		.proc_handler	= proc_dointvec,
 	},
 	{
 		.procname       = "tcp_thin_linear_timeouts",

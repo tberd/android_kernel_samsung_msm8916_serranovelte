@@ -322,22 +322,14 @@ int generic_permission(struct inode *inode, int mask)
 
 	if (S_ISDIR(inode->i_mode)) {
 		/* DACs are overridable for directories */
-		if (capable_wrt_inode_uidgid(inode, CAP_DAC_OVERRIDE))
-			return 0;
 		if (!(mask & MAY_WRITE))
 			if (capable_wrt_inode_uidgid(inode,
 						     CAP_DAC_READ_SEARCH))
 				return 0;
-		return -EACCES;
-	}
-	/*
-	 * Read/write DACs are always overridable.
-	 * Executable DACs are overridable when there is
-	 * at least one exec bit set.
-	 */
-	if (!(mask & MAY_EXEC) || (inode->i_mode & S_IXUGO))
 		if (capable_wrt_inode_uidgid(inode, CAP_DAC_OVERRIDE))
 			return 0;
+		return -EACCES;
+	}
 
 	/*
 	 * Searching includes executable on directories, else just read.
@@ -345,6 +337,14 @@ int generic_permission(struct inode *inode, int mask)
 	mask &= MAY_READ | MAY_WRITE | MAY_EXEC;
 	if (mask == MAY_READ)
 		if (capable_wrt_inode_uidgid(inode, CAP_DAC_READ_SEARCH))
+			return 0;
+	/*
+	 * Read/write DACs are always overridable.
+	 * Executable DACs are overridable when there is
+	 * at least one exec bit set.
+	 */
+	if (!(mask & MAY_EXEC) || (inode->i_mode & S_IXUGO))
+		if (capable_wrt_inode_uidgid(inode, CAP_DAC_OVERRIDE))
 			return 0;
 
 	return -EACCES;
@@ -530,6 +530,37 @@ static inline void unlock_rcu_walk(void)
 	br_read_unlock(&vfsmount_lock);
 }
 
+/*
+ * When we move over from the RCU domain to properly refcounted
+ * long-lived dentries, we need to check the sequence numbers
+ * we got before lookup very carefully.
+ *
+ * We cannot blindly increment a dentry refcount - even if it
+ * is not locked - if it is zero, because it may have gone
+ * through the final d_kill() logic already.
+ *
+ * So for a zero refcount, we need to get the spinlock (which is
+ * safe even for a dead dentry because the de-allocation is
+ * RCU-delayed), and check the sequence count under the lock.
+ *
+ * Once we have checked the sequence count, we know it is live,
+ * and since we hold the spinlock it cannot die from under us.
+ *
+ * In contrast, if the reference count wasn't zero, we can just
+ * increment the lockref without having to take the spinlock.
+ * Even if the sequence number ends up being stale, we haven't
+ * gone through the final dput() and killed the dentry yet.
+ */
+static inline int d_rcu_to_refcount(struct dentry *dentry, seqcount_t *validate, unsigned seq)
+{
+	if (likely(lockref_get_not_dead(&dentry->d_lockref))) {
+		if (!read_seqcount_retry(validate, seq))
+				return 0;
+		dput(dentry);
+	}
+	return -ECHILD;
+}
+
 /**
  * unlazy_walk - try to switch to ref-walk mode.
  * @nd: nameidata pathwalk data
@@ -554,29 +585,28 @@ static int unlazy_walk(struct nameidata *nd, struct dentry *dentry)
 				nd->root.dentry != fs->root.dentry)
 			goto err_root;
 	}
-	spin_lock(&parent->d_lock);
+
+	/*
+	 * For a negative lookup, the lookup sequence point is the parents
+	 * sequence point, and it only needs to revalidate the parent dentry.
+	 *
+	 * For a positive lookup, we need to move both the parent and the
+	 * dentry from the RCU domain to be properly refcounted. And the
+	 * sequence number in the dentry validates *both* dentry counters,
+	 * since we checked the sequence number of the parent after we got
+	 * the child sequence number. So we know the parent must still
+	 * be valid if the child sequence number is still valid.
+	 */
 	if (!dentry) {
-		if (!__d_rcu_to_refcount(parent, nd->seq))
-			goto err_parent;
+		if (d_rcu_to_refcount(parent, &parent->d_seq, nd->seq) < 0)
+			goto err_root;
 		BUG_ON(nd->inode != parent->d_inode);
 	} else {
-		if (dentry->d_parent != parent)
+		if (d_rcu_to_refcount(dentry, &dentry->d_seq, nd->seq) < 0)
+			goto err_root;
+		if (d_rcu_to_refcount(parent, &dentry->d_seq, nd->seq) < 0)
 			goto err_parent;
-		spin_lock_nested(&dentry->d_lock, DENTRY_D_LOCK_NESTED);
-		if (!__d_rcu_to_refcount(dentry, nd->seq))
-			goto err_child;
-		/*
-		 * If the sequence check on the child dentry passed, then
-		 * the child has not been removed from its parent. This
-		 * means the parent dentry must be valid and able to take
-		 * a reference at this point.
-		 */
-		BUG_ON(!IS_ROOT(dentry) && dentry->d_parent != parent);
-		BUG_ON(!parent->d_count);
-		parent->d_count++;
-		spin_unlock(&dentry->d_lock);
 	}
-	spin_unlock(&parent->d_lock);
 	if (want_root) {
 		path_get(&nd->root);
 		spin_unlock(&fs->lock);
@@ -587,10 +617,8 @@ static int unlazy_walk(struct nameidata *nd, struct dentry *dentry)
 	nd->flags &= ~LOOKUP_RCU;
 	return 0;
 
-err_child:
-	spin_unlock(&dentry->d_lock);
 err_parent:
-	spin_unlock(&parent->d_lock);
+	dput(dentry);
 err_root:
 	if (want_root)
 		spin_unlock(&fs->lock);
@@ -621,14 +649,11 @@ static int complete_walk(struct nameidata *nd)
 		nd->flags &= ~LOOKUP_RCU;
 		if (!(nd->flags & LOOKUP_ROOT))
 			nd->root.mnt = NULL;
-		spin_lock(&dentry->d_lock);
-		if (unlikely(!__d_rcu_to_refcount(dentry, nd->seq))) {
-			spin_unlock(&dentry->d_lock);
+
+		if (d_rcu_to_refcount(dentry, &dentry->d_seq, nd->seq) < 0) {
 			unlock_rcu_walk();
 			return -ECHILD;
 		}
-		BUG_ON(nd->inode != dentry->d_inode);
-		spin_unlock(&dentry->d_lock);
 		mntget(nd->path.mnt);
 		unlock_rcu_walk();
 	}
@@ -2390,11 +2415,6 @@ int vfs_create2(struct vfsmount *mnt, struct inode *dir, struct dentry *dentry,
 	if (error)
 		return error;
 	error = dir->i_op->create(dir, dentry, mode, want_excl);
-	if (error)
-		return error;
-	error = security_inode_post_create(dir, dentry, mode);
-	if (error)
-		return error;
 	if (!error)
 		fsnotify_create(dir, dentry);
 	return error;
@@ -2768,10 +2788,28 @@ static int do_last(struct nameidata *nd, struct path *path,
 	nd->flags &= ~LOOKUP_PARENT;
 	nd->flags |= op->intent;
 
-	if (nd->last_type != LAST_NORM) {
+	switch (nd->last_type) {
+	case LAST_DOTDOT:
+	case LAST_DOT:
 		error = handle_dots(nd, nd->last_type);
 		if (error)
 			return error;
+		/* fallthrough */
+	case LAST_ROOT:
+		error = complete_walk(nd);
+		if (error)
+			return error;
+		audit_inode(name, nd->path.dentry, 0);
+		if (open_flag & O_CREAT) {
+			error = -EISDIR;
+			goto out;
+		}
+		goto finish_open;
+	case LAST_BIND:
+		error = complete_walk(nd);
+		if (error)
+			return error;
+		audit_inode(name, dir, 0);
 		goto finish_open;
 	}
 
@@ -2902,19 +2940,19 @@ finish_lookup:
 	}
 	nd->inode = inode;
 	/* Why this, you ask?  _Now_ we might have grown LOOKUP_JUMPED... */
-finish_open:
 	error = complete_walk(nd);
 	if (error) {
 		path_put(&save_parent);
 		return error;
 	}
-	audit_inode(name, nd->path.dentry, 0);
 	error = -EISDIR;
 	if ((open_flag & O_CREAT) && S_ISDIR(nd->inode->i_mode))
 		goto out;
 	error = -ENOTDIR;
 	if ((nd->flags & LOOKUP_DIRECTORY) && !can_lookup(nd->inode))
 		goto out;
+	audit_inode(name, nd->path.dentry, 0);
+finish_open:
 	if (!S_ISREG(nd->inode->i_mode))
 		will_truncate = false;
 
@@ -3032,8 +3070,14 @@ static int do_tmpfile(int dfd, struct filename *pathname,
 	if (error)
 		goto out2;
 	error = open_check_o_direct(file);
-	if (error)
+	if (error) {
 		fput(file);
+	} else if (!(op->open_flag & O_EXCL)) {
+		struct inode *inode = file_inode(file);
+		spin_lock(&inode->i_lock);
+		inode->i_state |= I_LINKABLE;
+		spin_unlock(&inode->i_lock);
+	}
 out2:
 	mnt_drop_write(nd->path.mnt);
 out:
@@ -3114,10 +3158,9 @@ out2:
 }
 
 struct file *do_filp_open(int dfd, struct filename *pathname,
-		const struct open_flags *op)
+		const struct open_flags *op, int flags)
 {
 	struct nameidata nd;
-	int flags = op->lookup_flags;
 	struct file *filp;
 
 	filp = path_openat(dfd, pathname, &nd, op, flags | LOOKUP_RCU);
@@ -3129,15 +3172,16 @@ struct file *do_filp_open(int dfd, struct filename *pathname,
 }
 
 struct file *do_file_open_root(struct dentry *dentry, struct vfsmount *mnt,
-		const char *name, const struct open_flags *op)
+		const char *name, const struct open_flags *op, int flags)
 {
 	struct nameidata nd;
 	struct file *file;
 	struct filename filename = { .name = name };
-	int flags = op->lookup_flags | LOOKUP_ROOT;
 
 	nd.root.mnt = mnt;
 	nd.root.dentry = dentry;
+
+	flags |= LOOKUP_ROOT;
 
 	if (dentry->d_inode->i_op->follow_link && op->intent & LOOKUP_OPEN)
 		return ERR_PTR(-ELOOP);
@@ -3264,16 +3308,9 @@ int vfs_mknod2(struct vfsmount *mnt, struct inode *dir, struct dentry *dentry, u
 		return error;
 
 	error = dir->i_op->mknod(dir, dentry, mode, dev);
-	if (error)
-		return error;
-
-	error = security_inode_post_create(dir, dentry, mode);
-	if (error)
-		return error;
-
-	fsnotify_create(dir, dentry);
-
-	return 0;
+	if (!error)
+		fsnotify_create(dir, dentry);
+	return error;
 }
 EXPORT_SYMBOL(vfs_mknod2);
 
@@ -3428,7 +3465,7 @@ void dentry_unhash(struct dentry *dentry)
 {
 	shrink_dcache_parent(dentry);
 	spin_lock(&dentry->d_lock);
-	if (dentry->d_count == 1)
+	if (dentry->d_lockref.count == 1)
 		__d_drop(dentry);
 	spin_unlock(&dentry->d_lock);
 }
@@ -3755,12 +3792,18 @@ int vfs_link2(struct vfsmount *mnt, struct dentry *old_dentry, struct inode *dir
 
 	mutex_lock(&inode->i_mutex);
 	/* Make sure we don't allow creating hardlink to an unlinked file */
-	if (inode->i_nlink == 0)
+	if (inode->i_nlink == 0 && !(inode->i_state & I_LINKABLE))
 		error =  -ENOENT;
 	else if (max_links && inode->i_nlink >= max_links)
 		error = -EMLINK;
 	else
 		error = dir->i_op->link(old_dentry, dir, new_dentry);
+
+	if (!error && (inode->i_state & I_LINKABLE)) {
+		spin_lock(&inode->i_lock);
+		inode->i_state &= ~I_LINKABLE;
+		spin_unlock(&inode->i_lock);
+	}
 	mutex_unlock(&inode->i_mutex);
 	if (!error)
 		fsnotify_link(dir, inode, new_dentry);
@@ -3874,7 +3917,8 @@ SYSCALL_DEFINE2(link, const char __user *, oldname, const char __user *, newname
  */
 static int vfs_rename_dir(struct vfsmount *mnt,
 	       struct inode *old_dir, struct dentry *old_dentry,
-	       struct inode *new_dir, struct dentry *new_dentry)
+	       struct inode *new_dir, struct dentry *new_dentry,
+	       unsigned int flags)
 {
 	int error = 0;
 	struct inode *target = new_dentry->d_inode;
@@ -3909,7 +3953,13 @@ static int vfs_rename_dir(struct vfsmount *mnt,
 
 	if (target)
 		shrink_dcache_parent(new_dentry);
-	error = old_dir->i_op->rename(old_dir, old_dentry, new_dir, new_dentry);
+	if (!flags) {
+		error = old_dir->i_op->rename(old_dir, old_dentry,
+					      new_dir, new_dentry);
+	} else {
+		error = old_dir->i_op->rename2(old_dir, old_dentry,
+					       new_dir, new_dentry, flags);
+	}
 	if (error)
 		goto out;
 
@@ -3928,7 +3978,8 @@ out:
 }
 
 static int vfs_rename_other(struct inode *old_dir, struct dentry *old_dentry,
-			    struct inode *new_dir, struct dentry *new_dentry)
+			    struct inode *new_dir, struct dentry *new_dentry,
+				unsigned int flags)
 {
 	struct inode *target = new_dentry->d_inode;
 	int error;
@@ -3945,7 +3996,13 @@ static int vfs_rename_other(struct inode *old_dir, struct dentry *old_dentry,
 	if (d_mountpoint(old_dentry)||d_mountpoint(new_dentry))
 		goto out;
 
-	error = old_dir->i_op->rename(old_dir, old_dentry, new_dir, new_dentry);
+	if (!flags) {
+		error = old_dir->i_op->rename(old_dir, old_dentry,
+					      new_dir, new_dentry);
+	} else {
+		error = old_dir->i_op->rename2(old_dir, old_dentry,
+					       new_dir, new_dentry, flags);
+	}
 	if (error)
 		goto out;
 
@@ -3962,7 +4019,8 @@ out:
 
 int vfs_rename2(struct vfsmount *mnt,
 	       struct inode *old_dir, struct dentry *old_dentry,
-	       struct inode *new_dir, struct dentry *new_dentry)
+	       struct inode *new_dir, struct dentry *new_dentry,
+	       unsigned int flags)
 {
 	int error;
 	int is_dir = S_ISDIR(old_dentry->d_inode->i_mode);
@@ -3985,30 +4043,34 @@ int vfs_rename2(struct vfsmount *mnt,
 	if (!old_dir->i_op->rename)
 		return -EPERM;
 
+	if (flags && !old_dir->i_op->rename2)
+		return -EINVAL;
+
 	take_dentry_name_snapshot(&old_name, old_dentry);
 
 	if (is_dir)
-		error = vfs_rename_dir(mnt, old_dir,old_dentry,new_dir,new_dentry);
+		error = vfs_rename_dir(mnt, old_dir, old_dentry, new_dir, new_dentry, flags);
 	else
-		error = vfs_rename_other(old_dir,old_dentry,new_dir,new_dentry);
+		error = vfs_rename_other(old_dir, old_dentry, new_dir, new_dentry, flags);
 	if (!error)
 		fsnotify_move(old_dir, new_dir, old_name.name, is_dir,
 			      new_dentry->d_inode, old_dentry);
-	take_dentry_name_snapshot(&old_name, old_dentry);
+	release_dentry_name_snapshot(&old_name);
 
 	return error;
 }
 EXPORT_SYMBOL(vfs_rename2);
 
 int vfs_rename(struct inode *old_dir, struct dentry *old_dentry,
-	       struct inode *new_dir, struct dentry *new_dentry)
+	       struct inode *new_dir, struct dentry *new_dentry,
+	       unsigned int flags)
 {
-	return vfs_rename2(NULL, old_dir, old_dentry, new_dir, new_dentry);
+	return vfs_rename2(NULL, old_dir, old_dentry, new_dir, new_dentry, flags);
 }
 EXPORT_SYMBOL(vfs_rename);
 
-SYSCALL_DEFINE4(renameat, int, olddfd, const char __user *, oldname,
-		int, newdfd, const char __user *, newname)
+SYSCALL_DEFINE5(renameat2, int, olddfd, const char __user *, oldname,
+		int, newdfd, const char __user *, newname, unsigned int, flags)
 {
 	struct dentry *old_dir, *new_dir;
 	struct dentry *old_dentry, *new_dentry;
@@ -4019,6 +4081,10 @@ SYSCALL_DEFINE4(renameat, int, olddfd, const char __user *, oldname,
 	unsigned int lookup_flags = 0;
 	bool should_retry = false;
 	int error;
+
+	if (flags & ~RENAME_NOREPLACE)
+		return -EINVAL;
+
 retry:
 	from = user_path_parent(olddfd, oldname, &oldnd, lookup_flags);
 	if (IS_ERR(from)) {
@@ -4042,6 +4108,8 @@ retry:
 		goto exit2;
 
 	new_dir = newnd.path.dentry;
+	if (flags & RENAME_NOREPLACE)
+		error = -EEXIST;
 	if (newnd.last_type != LAST_NORM)
 		goto exit2;
 
@@ -4063,22 +4131,25 @@ retry:
 	error = -ENOENT;
 	if (!old_dentry->d_inode)
 		goto exit4;
-	/* unless the source is a directory trailing slashes give -ENOTDIR */
-	if (!S_ISDIR(old_dentry->d_inode->i_mode)) {
-		error = -ENOTDIR;
-		if (oldnd.last.name[oldnd.last.len])
-			goto exit4;
-		if (newnd.last.name[newnd.last.len])
-			goto exit4;
-	}
-	/* source should not be ancestor of target */
-	error = -EINVAL;
-	if (old_dentry == trap)
-		goto exit4;
 	new_dentry = lookup_hash(&newnd);
 	error = PTR_ERR(new_dentry);
 	if (IS_ERR(new_dentry))
 		goto exit4;
+	error = -EEXIST;
+	if ((flags & RENAME_NOREPLACE) && !d_is_negative(new_dentry))
+		goto exit5;
+	/* unless the source is a directory trailing slashes give -ENOTDIR */
+	if (!S_ISDIR(old_dentry->d_inode->i_mode)) {
+		error = -ENOTDIR;
+		if (oldnd.last.name[oldnd.last.len])
+			goto exit5;
+		if (newnd.last.name[newnd.last.len])
+			goto exit5;
+	}
+	/* source should not be ancestor of target */
+	error = -EINVAL;
+	if (old_dentry == trap)
+		goto exit5;
 	/* target should not be an ancestor of source */
 	error = -ENOTEMPTY;
 	if (new_dentry == trap)
@@ -4089,7 +4160,7 @@ retry:
 	if (error)
 		goto exit5;
 	error = vfs_rename2(oldnd.path.mnt, old_dir->d_inode, old_dentry,
-				   new_dir->d_inode, new_dentry);
+				   new_dir->d_inode, new_dentry, flags);
 exit5:
 	dput(new_dentry);
 exit4:
@@ -4114,10 +4185,30 @@ exit:
 	return error;
 }
 
+SYSCALL_DEFINE4(renameat, int, olddfd, const char __user *, oldname,
+		int, newdfd, const char __user *, newname)
+{
+	return sys_renameat2(olddfd, oldname, newdfd, newname, 0);
+}
+
 SYSCALL_DEFINE2(rename, const char __user *, oldname, const char __user *, newname)
 {
-	return sys_renameat(AT_FDCWD, oldname, AT_FDCWD, newname);
+	return sys_renameat2(AT_FDCWD, oldname, AT_FDCWD, newname, 0);
 }
+
+int vfs_whiteout(struct inode *dir, struct dentry *dentry)
+{
+	int error = may_create(NULL, dir, dentry);
+	if (error)
+		return error;
+
+	if (!dir->i_op->mknod)
+		return -EPERM;
+
+	return dir->i_op->mknod(dir, dentry,
+				S_IFCHR | WHITEOUT_MODE, WHITEOUT_DEV);
+}
+EXPORT_SYMBOL(vfs_whiteout);
 
 int vfs_readlink(struct dentry *dentry, char __user *buffer, int buflen, const char *link)
 {
